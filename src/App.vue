@@ -41,6 +41,10 @@ interface SettingsView {
   api_key_hint: string;
   /** "panel" | "dsh" | "none" */
   api_key_source: string;
+  /** Feishu state, filled by QR pairing. */
+  feishu_paired: boolean;
+  feishu_app_id: string | null;
+  feishu_allowed_users: string[];
 }
 
 interface BalanceInfo {
@@ -220,6 +224,11 @@ async function loadSettings() {
     const s = await invoke<SettingsView>("get_settings");
     settings.value = s;
     sourceDir.value = s.desktop_source_dir ?? "";
+    // Seed the allow-list box from what QR pairing recorded, so the bridge can
+    // start without the user retyping their own open_id.
+    if (!bridgeUsers.value.trim() && s.feishu_allowed_users.length) {
+      bridgeUsers.value = s.feishu_allowed_users.join(", ");
+    }
   } catch (e) {
     say("err", String(e));
   }
@@ -591,6 +600,14 @@ async function beginFeishuQr() {
 async function startBridge() {
   busy.value = "feishu";
   try {
+    // Persist the box's contents first: the bridge reads the stored list when
+    // its argument is empty, and this keeps the two in sync.
+    await invoke<ActionResult>("set_feishu_allowed_users", {
+      users: bridgeUsers.value
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+    });
     const r = await invoke<ActionResult>("feishu_bridge_start", {
       allowedUsers: bridgeUsers.value,
       profile: "headless",
@@ -906,8 +923,16 @@ onUnmounted(() => {
         <section class="panel">
           <h3>飞书远程控制</h3>
           <p class="hint">
-            在飞书里给机器人发消息 → 本机执行 <code>dsh --profile headless</code> → 结果回飞书。
-            需要先建好飞书应用并 <code>lark-cli config init</code>。
+            <template v-if="settings?.feishu_paired">
+              已配对：<code>{{ settings.feishu_app_id }}</code>
+              <template v-if="settings.feishu_allowed_users.length">
+                · 白名单 {{ settings.feishu_allowed_users.length }} 项
+              </template>
+            </template>
+            <template v-else>
+              还没配对。点下面的「扫码配对飞书」，用飞书扫一下二维码即可 ——
+            会自动创建应用、绑定 lark-cli 并把你的 open_id 填进白名单。
+            </template>
           </p>
           <div class="field">
             <input v-model="bridgeUsers" class="input mono" type="text" spellcheck="false" placeholder="白名单 open_id（ou_ 开头，逗号分隔）" />

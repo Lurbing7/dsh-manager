@@ -353,6 +353,10 @@ struct SettingsView {
     api_key_hint: String,
     /// "panel" (entered here) · "dsh" (harness credential store) · "none"
     api_key_source: String,
+    /// Feishu state, filled by the QR pairing flow.
+    feishu_app_id: Option<String>,
+    feishu_paired: bool,
+    feishu_allowed_users: Vec<String>,
 }
 
 /// Keep the last four characters; enough to identify a key, useless to steal.
@@ -909,6 +913,37 @@ fn get_settings(app: AppHandle) -> SettingsView {
         api_key_set: key.is_some(),
         api_key_hint: key.as_deref().map(mask_key).unwrap_or_default(),
         api_key_source: source.to_string(),
+        feishu_paired: settings
+            .feishu_app_id
+            .as_deref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false),
+        feishu_app_id: settings.feishu_app_id,
+        feishu_allowed_users: settings.feishu_allowed_users.unwrap_or_default(),
+    }
+}
+
+/// Let the bridge start without the user re-typing the allow-list the QR flow
+/// already recorded: an empty request falls back to the stored list.
+#[tauri::command]
+fn set_feishu_allowed_users(app: AppHandle, users: Vec<String>) -> ActionResult {
+    let mut settings = load_settings(&app);
+    let cleaned: Vec<String> = users
+        .into_iter()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .collect();
+    settings.feishu_allowed_users = Some(cleaned.clone());
+    save_settings(&app, &settings);
+    ActionResult {
+        ok: true,
+        action: "settings".into(),
+        message: if cleaned.is_empty() {
+            "已清空白名单".into()
+        } else {
+            format!("白名单已保存（{} 项）", cleaned.len())
+        },
+        output: String::new(),
     }
 }
 
@@ -1373,12 +1408,20 @@ fn feishu_bridge_start(
             output: String::new(),
         };
     }
-    let allowed = allowed_users.trim().to_string();
+    // An empty argument means "use whatever pairing already recorded".
+    let allowed = if allowed_users.trim().is_empty() {
+        load_settings(&app)
+            .feishu_allowed_users
+            .unwrap_or_default()
+            .join(",")
+    } else {
+        allowed_users.trim().to_string()
+    };
     if allowed.is_empty() {
         return ActionResult {
             ok: false,
             action: "feishu".into(),
-            message: "请先填白名单 open_id（ou_ 开头）。留空等于对所有人开放本机执行权限，所以不允许启动。".into(),
+            message: "请先填白名单 open_id（ou_ 开头），或先用「扫码配对飞书」自动写入。留空等于对所有人开放本机执行权限，所以不允许启动。".into(),
             output: String::new(),
         };
     }
@@ -3046,6 +3089,7 @@ pub fn run() {
             stop_harness,
             get_settings,
             set_api_key,
+            set_feishu_allowed_users,
             set_desktop_source_dir,
             start_desktop_app,
             stop_desktop_app,
