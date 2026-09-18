@@ -2825,6 +2825,12 @@ fn feishu_qr_apply(
 
     // Bind lark-cli so its IM commands use this app. `--app-secret-stdin` keeps
     // the secret off the process command line.
+    //
+    // `--force-init` is required here: this machine has a Hermes environment, and
+    // lark-cli refuses to init inside an Agent context by default (it would
+    // rather you bind to the Agent's existing app). The QR flow deliberately
+    // created a *separate* app for this panel, so the flag is exactly the
+    // documented escape hatch.
     let mut child = match Command::new("cmd")
         .arg("/c")
         .arg("lark-cli")
@@ -2833,6 +2839,9 @@ fn feishu_qr_apply(
         .arg("--app-id")
         .arg(app_id.trim())
         .arg("--app-secret-stdin")
+        .arg("--force-init")
+        .arg("--brand")
+        .arg("feishu")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2855,10 +2864,16 @@ fn feishu_qr_apply(
         let _ = stdin.write_all(app_secret.trim().as_bytes());
         let _ = stdin.write_all(b"\n");
     }
-    let bind_ok = child
-        .wait_with_output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let output = child.wait_with_output();
+    let bind_ok = output.as_ref().map(|o| o.status.success()).unwrap_or(false);
+    let bind_detail = output
+        .as_ref()
+        .map(|o| {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let out = String::from_utf8_lossy(&o.stdout);
+            format!("{out}{err}").trim().to_string()
+        })
+        .unwrap_or_default();
 
     let allowed = settings
         .feishu_allowed_users
@@ -2873,7 +2888,8 @@ fn feishu_qr_apply(
             format!("配对完成。已绑定 lark-cli，白名单已设为 {allowed}")
         } else {
             format!(
-                "配对完成、凭据已保存，但 lark-cli config init 没有成功（可能未安装）。白名单已设为 {allowed}"
+                "配对完成、凭据已保存，但 lark-cli 绑定失败。白名单已设为 {allowed}。原因：{}",
+                bind_detail.chars().take(300).collect::<String>()
             )
         },
         output: String::new(),
