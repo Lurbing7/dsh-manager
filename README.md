@@ -36,7 +36,7 @@ DeepSeek Harness 的 Windows 桌面小面板：常驻托盘，只做两件事—
 | HTTP | reqwest（rustls，不依赖系统 OpenSSL） |
 | 版本比较 | semver |
 
-选 Tauri 而不是 Electron 的原因：本机已有 Tauri 项目跑通（`C:\workspace\projects\desktop-toolbox`），Rust 工具链就绪，产物是单 exe、体积小；而这个应用要做的事（起进程、查 HTTP、读文件）正好都在 Rust 侧。
+选 Tauri 而不是 Electron 的原因：本机已有 Tauri 项目跑通（`D:\projects\desktop-toolbox`），Rust 工具链就绪，产物是单 exe、体积小；而这个应用要做的事（起进程、查 HTTP、读文件）正好都在 Rust 侧。
 
 ## 运行
 
