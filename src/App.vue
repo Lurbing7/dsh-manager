@@ -578,7 +578,7 @@ onUnmounted(() => {
           <span class="stat-value">
             ¥{{ (series?.month_cost ?? 0).toFixed(2) }}
           </span>
-          <span class="stat-sub">{{ series?.month_calls ?? 0 }} 次调用 · {{ ((series?.month_tokens ?? 0) / 1000).toFixed(0) }}K 令牌</span>
+          <span class="stat-sub">{{ series?.month_calls ?? 0 }} 次调用 · {{ ((series?.month_tokens ?? 0) / 1000).toFixed(0) }}K tokens</span>
         </div>
         <div class="stat">
           <span class="stat-label">剩余余额</span>

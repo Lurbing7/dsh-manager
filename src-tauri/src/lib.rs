@@ -1668,44 +1668,59 @@ fn open_hermes_page() -> ActionResult {
 //   %APPDATA%\<identifier>\usage\YYYY-MM-DD.json   (one aggregated file per day)
 // ---------------------------------------------------------------------------
 
+/// One aggregate over the same five token buckets. Used at day level, per model
+/// and per session, so every view shares one arithmetic.
 #[derive(Serialize, Deserialize, Clone, Default)]
-struct ModelDay {
+struct Bucket {
     calls: u64,
-    tokens: u64,
-    cost: f64,
-}
-
-#[derive(Serialize, Deserialize, Clone, Default)]
-struct DayUsage {
-    date: String,
-    calls: u64,
+    /// Prompt tokens that were *not* served from cache.
     input_tokens: u64,
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
     reasoning_tokens: u64,
     cost: f64,
-    by_model: HashMap<String, ModelDay>,
+    /// DeepSeek bills peak and off-peak hours at different rates.
+    peak_cost: f64,
+    offpeak_cost: f64,
+    peak_calls: u64,
 }
 
-impl DayUsage {
-    /// Billed total for the day: prompt + completion. Cache *reads* are not
-    /// added here because they are already billed at a different rate and would
-    /// double-count the prompt (the plugin reports them as a separate bucket).
+impl Bucket {
+    /// Total tokens processed: prompt (cache-miss + cache-hit) plus completion.
+    ///
+    /// `cache_write_tokens` is deliberately excluded: the recorder sets it equal
+    /// to the miss count (a miss is what gets written to cache), so adding it
+    /// would double-count the prompt. The plugin's own `tokens` figure does
+    /// exactly that, which is why its totals look inflated.
     fn tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens + self.cache_write_tokens
+        self.input_tokens + self.cache_read_tokens + self.output_tokens
+    }
+
+    /// Prompt tokens seen, cached or not.
+    fn prompt_tokens(&self) -> u64 {
+        self.input_tokens + self.cache_read_tokens
+    }
+
+    /// Cache hit rate as a percentage (0 when no prompt tokens were seen).
+    fn cache_hit_pct(&self) -> f64 {
+        let prompt = self.prompt_tokens();
+        if prompt == 0 {
+            return 0.0;
+        }
+        (self.cache_read_tokens as f64 / prompt as f64) * 100.0
     }
 
     #[allow(clippy::too_many_arguments)]
     fn add(
         &mut self,
-        model: &str,
         input: u64,
         output: u64,
         cache_read: u64,
         cache_write: u64,
         reasoning: u64,
         cost: f64,
+        peak: bool,
     ) {
         self.calls += 1;
         self.input_tokens += input;
@@ -1714,11 +1729,37 @@ impl DayUsage {
         self.cache_write_tokens += cache_write;
         self.reasoning_tokens += reasoning;
         self.cost += cost;
-        let entry = self.by_model.entry(model.to_string()).or_default();
-        entry.calls += 1;
-        entry.tokens += input + output + cache_write;
-        entry.cost += cost;
+        if peak {
+            self.peak_cost += cost;
+            self.peak_calls += 1;
+        } else {
+            self.offpeak_cost += cost;
+        }
     }
+
+    fn merge(&mut self, other: &Bucket) {
+        self.calls += other.calls;
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+        self.cost += other.cost;
+        self.peak_cost += other.peak_cost;
+        self.offpeak_cost += other.offpeak_cost;
+        self.peak_calls += other.peak_calls;
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct DayUsage {
+    date: String,
+    #[serde(flatten)]
+    total: Bucket,
+    by_model: HashMap<String, Bucket>,
+    /// Session id -> usage. Feeds the "top sessions" ranking.
+    #[serde(default)]
+    by_session: HashMap<String, Bucket>,
 }
 
 fn usage_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1855,19 +1896,30 @@ async fn import_plugin_usage(app: AppHandle) -> ActionResult {
             continue;
         }
         let date = local_date(ts);
+        let input = r["inputTokens"].as_u64().unwrap_or(0);
+        let output = r["outputTokens"].as_u64().unwrap_or(0);
+        let cache_read = r["cacheReadTokens"].as_u64().unwrap_or(0);
+        let cache_write = r["cacheWriteTokens"].as_u64().unwrap_or(0);
+        let reasoning = r["reasoningTokens"].as_u64().unwrap_or(0);
+        let cost = r["autoCost"].as_f64().unwrap_or(0.0);
+        let peak = r["peak"].as_bool().unwrap_or(false);
+        let model = r["model"].as_str().unwrap_or("unknown").to_string();
+        let session = r["sessionId"].as_str().unwrap_or("").to_string();
+
         let day = days.entry(date.clone()).or_insert_with(|| DayUsage {
             date,
             ..Default::default()
         });
-        day.add(
-            r["model"].as_str().unwrap_or("unknown"),
-            r["inputTokens"].as_u64().unwrap_or(0),
-            r["outputTokens"].as_u64().unwrap_or(0),
-            r["cacheReadTokens"].as_u64().unwrap_or(0),
-            r["cacheWriteTokens"].as_u64().unwrap_or(0),
-            r["reasoningTokens"].as_u64().unwrap_or(0),
-            r["autoCost"].as_f64().unwrap_or(0.0),
+        day.total
+            .add(input, output, cache_read, cache_write, reasoning, cost, peak);
+        day.by_model.entry(model).or_default().add(
+            input, output, cache_read, cache_write, reasoning, cost, peak,
         );
+        if !session.is_empty() {
+            day.by_session.entry(session).or_default().add(
+                input, output, cache_read, cache_write, reasoning, cost, peak,
+            );
+        }
     }
 
     let total_days = days.len();
@@ -1876,7 +1928,7 @@ async fn import_plugin_usage(app: AppHandle) -> ActionResult {
     for day in days.values() {
         if save_day(&dir, day).is_ok() {
             written += 1;
-            cost += day.cost;
+            cost += day.total.cost;
         }
     }
 
@@ -1935,9 +1987,9 @@ fn usage_series(app: AppHandle, bucket: Option<String>, count: Option<u32>) -> U
     let mut month_calls = 0u64;
     for d in &days {
         if d.date.starts_with(&month_prefix) {
-            month_cost += d.cost;
-            month_tokens += d.tokens();
-            month_calls += d.calls;
+            month_cost += d.total.cost;
+            month_tokens += d.total.tokens();
+            month_calls += d.total.calls;
         }
     }
 
@@ -2007,9 +2059,9 @@ fn usage_series(app: AppHandle, bucket: Option<String>, count: Option<u32>) -> U
             continue;
         }
         let slot = acc.entry(bucket_key).or_insert((0.0, 0, 0));
-        slot.0 += d.cost;
-        slot.1 += d.tokens();
-        slot.2 += d.calls;
+        slot.0 += d.total.cost;
+        slot.1 += d.total.tokens();
+        slot.2 += d.total.calls;
     }
 
     let mut points = Vec::new();
@@ -2167,8 +2219,602 @@ async fn get_balance_native(provider: Option<String>) -> BalanceInfo {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Session scanner
+//
+// The kernel (packages/llm/token-meter) derives exact per-turn token usage from
+// session events, but never writes a separate usage file: the only durable
+// record is the session log itself. Session logs are *multi-frame* zstd
+// (one frame appended per write; the file we inspected held 1174 frames), so a
+// single-shot decompressor fails on them - `zstd::stream::read::Decoder` walks
+// frame boundaries itself.
+// ---------------------------------------------------------------------------
+
+fn sessions_root() -> Option<PathBuf> {
+    let home = std::env::var("USERPROFILE").ok()?;
+    let dir = PathBuf::from(home).join(".dsh").join("sessions");
+    if dir.is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// Every session log under the root (order unspecified; callers sort).
+fn session_files(root: &PathBuf) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(".jsonl.zstd"))
+                .unwrap_or(false)
+            {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Decompress a multi-frame zstd session log into its JSONL lines.
+fn read_session_lines(path: &PathBuf) -> Result<Vec<String>, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("打开失败: {e}"))?;
+    let mut decoder =
+        zstd::stream::read::Decoder::new(file).map_err(|e| format!("zstd 初始化失败: {e}"))?;
+    let mut text = String::new();
+    decoder
+        .read_to_string(&mut text)
+        .map_err(|e| format!("解压失败: {e}"))?;
+    Ok(text.lines().map(|l| l.to_string()).collect())
+}
+
+/// Diagnostic pass: report what event types actually appear in the logs, so the
+/// aggregation is written against the real structure rather than a guess.
+#[tauri::command]
+fn scan_sessions_diag(limit: Option<usize>) -> ActionResult {
+    let Some(root) = sessions_root() else {
+        return ActionResult {
+            ok: false,
+            action: "scan".into(),
+            message: "找不到 ~/.dsh/sessions".into(),
+            output: String::new(),
+        };
+    };
+    let mut files = session_files(&root);
+    files.sort();
+    let limit = limit.unwrap_or(3);
+
+    let mut by_type: HashMap<String, usize> = HashMap::new();
+    let mut samples: Vec<String> = Vec::new();
+    let mut usage_samples: Vec<String> = Vec::new();
+    let mut events = 0usize;
+    let mut total_lines = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    for path in files.iter().take(limit) {
+        match read_session_lines(path) {
+            Ok(lines) => {
+                total_lines += lines.len();
+                for line in lines {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    events += 1;
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                        continue;
+                    };
+                    let ty = v["type"].as_str().unwrap_or("<no type>").to_string();
+                    *by_type.entry(ty.clone()).or_insert(0) += 1;
+
+                    // Keep several raw usage objects: the first one may lack
+                    // optional buckets, which hides the real accounting.
+                    if ty == "assistant/message" && usage_samples.len() < 8 {
+                        let usage = &v["data"]["usage"];
+                        if !usage.is_null() {
+                            usage_samples.push(format!(
+                                "usage[{}] {}",
+                                usage_samples.len(),
+                                serde_json::to_string(usage).unwrap_or_default()
+                            ));
+                        } else {
+                            usage_samples.push(format!(
+                                "usage[{}] <null> keys={}",
+                                usage_samples.len(),
+                                v["data"]
+                                    .as_object()
+                                    .map(|o| o.keys().cloned().collect::<Vec<_>>().join(","))
+                                    .unwrap_or_default()
+                            ));
+                        }
+                    }
+                    if ty.contains("turn/") && samples.len() < 2 {
+                        samples.push(format!(
+                            "[{ty}] {}",
+                            trimmed.chars().take(300).collect::<String>()
+                        ));
+                    }
+                }
+            }
+            Err(e) => errors.push(format!("{}: {e}", path.display())),
+        }
+    }
+
+    let mut lines = vec![
+        format!("扫描文件: {} / {}", limit.min(files.len()), files.len()),
+        format!("事件行数: {total_lines}，解析成功 {events}"),
+        String::new(),
+        "事件类型分布:".to_string(),
+    ];
+    let mut types: Vec<_> = by_type.iter().collect();
+    types.sort_by(|a, b| b.1.cmp(a.1));
+    for (k, v) in types.iter().take(24) {
+        lines.push(format!("  {k}: {v}"));
+    }
+    if !errors.is_empty() {
+        lines.push(String::new());
+        lines.push("错误:".into());
+        for e in errors.iter().take(5) {
+            lines.push(format!("  {e}"));
+        }
+    }
+    lines.push(String::new());
+    lines.push("assistant/message 的 usage 采样:".into());
+    for s in &usage_samples {
+        lines.push(format!("  {s}"));
+    }
+    lines.push(String::new());
+    lines.push("turn 事件样本:".into());
+    for s in &samples {
+        lines.push(format!("  {s}"));
+    }
+
+    ActionResult {
+        ok: true,
+        action: "scan".into(),
+        message: lines.join("\n"),
+        output: String::new(),
+    }
+}
+
+/// One row of the per-model breakdown table.
+#[derive(Serialize, Clone)]
+struct ModelRow {
+    model: String,
+    calls: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    peak_cost: f64,
+    offpeak_cost: f64,
+    cost: f64,
+    cache_hit_pct: f64,
+    /// Share of the range total, so the UI can draw an inline bar.
+    cost_share: f64,
+}
+
+#[derive(Serialize, Clone)]
+struct SessionRow {
+    session: String,
+    calls: u64,
+    tokens: u64,
+    cost: f64,
+}
+
+#[derive(Serialize, Clone)]
+struct UsageAnalysis {
+    ok: bool,
+    /// 0 means "everything we have".
+    range_days: u32,
+    range_label: String,
+    total: Bucket,
+    cache_hit_pct: f64,
+    today_cost: f64,
+    month_cost: f64,
+    month_elapsed_days: u32,
+    month_total_days: u32,
+    /// Linear extrapolation of the current month, for the "預計" figure.
+    month_projection: f64,
+    models: Vec<ModelRow>,
+    sessions: Vec<SessionRow>,
+    first_date: String,
+    last_date: String,
+    error: Option<String>,
+}
+
+/// Everything the analysis page needs, in one call: totals, per-model rows and
+/// the top sessions for a time range.
+#[tauri::command]
+fn usage_analysis(app: AppHandle, days: Option<u32>) -> UsageAnalysis {
+    let range_days = days.unwrap_or(0);
+    let fail = |err: String| UsageAnalysis {
+        ok: false,
+        range_days,
+        range_label: String::new(),
+        total: Bucket::default(),
+        cache_hit_pct: 0.0,
+        today_cost: 0.0,
+        month_cost: 0.0,
+        month_elapsed_days: 0,
+        month_total_days: 0,
+        month_projection: 0.0,
+        models: Vec::new(),
+        sessions: Vec::new(),
+        first_date: String::new(),
+        last_date: String::new(),
+        error: Some(err),
+    };
+
+    let all = match load_all_days(&app) {
+        Ok(d) => d,
+        Err(e) => return fail(e),
+    };
+    if all.is_empty() {
+        return fail("还没有本地用量数据。在设置里点「导入插件历史用量」，或让 harness 跑一段时间。".into());
+    }
+
+    let today = chrono::Local::now().date_naive();
+    let month_prefix = today.format("%Y-%m").to_string();
+
+    // Range filter: keep the last N local calendar days, counting today.
+    let cutoff = if range_days == 0 {
+        None
+    } else {
+        Some((today - chrono::Duration::days(range_days.saturating_sub(1) as i64)).format("%Y-%m-%d").to_string())
+    };
+
+    let mut total = Bucket::default();
+    let mut models: HashMap<String, Bucket> = HashMap::new();
+    let mut sessions: HashMap<String, Bucket> = HashMap::new();
+    let mut today_cost = 0.0;
+    let mut month_cost = 0.0;
+    let today_key = today.format("%Y-%m-%d").to_string();
+
+    for day in &all {
+        if let Some(ref c) = cutoff {
+            if day.date.as_str() < c.as_str() {
+                continue;
+            }
+        }
+        total.merge(&day.total);
+        if day.date == today_key {
+            today_cost += day.total.cost;
+        }
+        if day.date.starts_with(&month_prefix) {
+            month_cost += day.total.cost;
+        }
+        for (model, bucket) in &day.by_model {
+            models.entry(model.clone()).or_default().merge(bucket);
+        }
+        for (session, bucket) in &day.by_session {
+            sessions.entry(session.clone()).or_default().merge(bucket);
+        }
+    }
+
+    let total_cost = total.cost;
+    let mut model_rows: Vec<ModelRow> = models
+        .into_iter()
+        .map(|(model, b)| ModelRow {
+            model,
+            calls: b.calls,
+            input_tokens: b.input_tokens,
+            output_tokens: b.output_tokens,
+            cache_read_tokens: b.cache_read_tokens,
+            cache_write_tokens: b.cache_write_tokens,
+            reasoning_tokens: b.reasoning_tokens,
+            peak_cost: b.peak_cost,
+            offpeak_cost: b.offpeak_cost,
+            cost: b.cost,
+            cache_hit_pct: b.cache_hit_pct(),
+            cost_share: if total_cost > 0.0 {
+                b.cost / total_cost * 100.0
+            } else {
+                0.0
+            },
+        })
+        .collect();
+    model_rows.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut session_rows: Vec<SessionRow> = sessions
+        .into_iter()
+        .map(|(session, b)| SessionRow {
+            session,
+            calls: b.calls,
+            tokens: b.tokens(),
+            cost: b.cost,
+        })
+        .collect();
+    session_rows.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
+    session_rows.truncate(10);
+
+    // Month projection: elapsed days include today.
+    let elapsed = today.day();
+    let total_days_in_month = days_in_month(today.year(), today.month());
+    let projection = if elapsed > 0 {
+        month_cost / elapsed as f64 * total_days_in_month as f64
+    } else {
+        0.0
+    };
+
+    let first_date = all.first().map(|d| d.date.clone()).unwrap_or_default();
+    let last_date = all.last().map(|d| d.date.clone()).unwrap_or_default();
+    let range_label = if range_days == 0 {
+        format!("全部（{first_date} 起）")
+    } else {
+        format!("近 {range_days} 天")
+    };
+
+    UsageAnalysis {
+        ok: true,
+        range_days,
+        range_label,
+        cache_hit_pct: total.cache_hit_pct(),
+        total,
+        today_cost,
+        month_cost,
+        month_elapsed_days: elapsed,
+        month_total_days: total_days_in_month,
+        month_projection: projection,
+        models: model_rows,
+        sessions: session_rows,
+        first_date,
+        last_date,
+        error: None,
+    }
+}
+
+/// Days in a calendar month (handles leap years without a date library call).
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
+
+/// Build the per-day usage map straight from the session logs.
+///
+/// Every billed model call lands as one `assistant/message` event carrying
+/// `data.usage` (the five token buckets) and `data.message.source`
+/// (provider/model). `time` is the event's own millisecond timestamp, so days
+/// are bucketed in local time exactly like the plugin did.
+///
+/// Returns (day map, files scanned, usage events seen).
+fn collect_session_usage(
+    cutoff_ms: i64,
+) -> Result<(HashMap<String, DayUsage>, usize, usize), String> {
+    let root = sessions_root().ok_or("找不到 ~/.dsh/sessions")?;
+    let files = session_files(&root);
+
+    let mut days: HashMap<String, DayUsage> = HashMap::new();
+    let mut scanned = 0usize;
+    let mut usage_events = 0usize;
+
+    for path in files {
+        // Skip whole files that predate the window: a session file only grows,
+        // so its mtime bounds the newest event inside it.
+        if cutoff_ms > 0 {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            let mtime_ms = modified
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if mtime_ms < cutoff_ms {
+                continue;
+            }
+        }
+
+        let Ok(lines) = read_session_lines(&path) else {
+            continue;
+        };
+        scanned += 1;
+
+        for line in lines {
+            let trimmed = line.trim();
+            // Cheap pre-filter before paying for a full JSON parse.
+            if trimmed.is_empty() || !trimmed.contains("assistant/message") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                continue;
+            };
+            if v["type"].as_str() != Some("assistant/message") {
+                continue;
+            }
+            let usage = &v["data"]["usage"];
+            if usage.is_null() {
+                continue;
+            }
+            let ts = v["time"].as_i64().unwrap_or(0);
+            if ts <= 0 {
+                continue;
+            }
+            if cutoff_ms > 0 && ts < cutoff_ms {
+                continue;
+            }
+
+            let input = usage["inputTokens"].as_u64().unwrap_or(0);
+            let output = usage["outputTokens"].as_u64().unwrap_or(0);
+            let cache_read = usage["cacheReadTokens"].as_u64().unwrap_or(0);
+            let cache_write = usage["cacheWriteTokens"].as_u64().unwrap_or(0);
+            let reasoning = usage["reasoningTokens"].as_u64().unwrap_or(0);
+            let model = v["data"]["message"]["source"]["model"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
+            let session = v["data"]["message"]["id"]
+                .as_str()
+                .map(|_| path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string())
+                .unwrap_or_default();
+
+            usage_events += 1;
+
+            // Session logs carry no cost figure (pricing is a plugin concern),
+            // so cost stays 0 here and the day file keeps whatever the plugin
+            // import already recorded. Peak/off-peak cannot be derived either.
+            let date = local_date(ts);
+            let day = days.entry(date.clone()).or_insert_with(|| DayUsage {
+                date,
+                ..Default::default()
+            });
+            day.total
+                .add(input, output, cache_read, cache_write, reasoning, 0.0, false);
+            day.by_model.entry(model).or_default().add(
+                input, output, cache_read, cache_write, reasoning, 0.0, false,
+            );
+            if !session.is_empty() {
+                day.by_session.entry(session).or_default().add(
+                    input, output, cache_read, cache_write, reasoning, 0.0, false,
+                );
+            }
+        }
+    }
+
+    Ok((days, scanned, usage_events))
+}
+
+/// Resolve the usage directory without an AppHandle (CLI paths).
+fn usage_dir_headless() -> Result<PathBuf, String> {
+    let appdata = std::env::var("APPDATA").map_err(|e| format!("取不到 APPDATA: {e}"))?;
+    let dir = PathBuf::from(appdata)
+        .join("com.dshpanel.app")
+        .join("usage");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建用量目录失败: {e}"))?;
+    Ok(dir)
+}
+
+/// Core of the session refresh, independent of Tauri so the CLI can run it.
+fn scan_sessions_at(dir: &PathBuf, days: Option<u32>) -> ActionResult {
+    let cutoff_ms = match days {
+        Some(n) if n > 0 => {
+            let now = chrono::Local::now().date_naive();
+            let start = now - chrono::Duration::days(n.saturating_sub(1) as i64);
+            start
+                .and_hms_opt(0, 0, 0)
+                .and_then(|dt| dt.and_local_timezone(chrono::Local).single())
+                .map(|dt| dt.timestamp_millis())
+                .unwrap_or(0)
+        }
+        _ => 0,
+    };
+
+    let (found, scanned, events) = match collect_session_usage(cutoff_ms) {
+        Ok(v) => v,
+        Err(e) => {
+            return ActionResult {
+                ok: false,
+                action: "scan".into(),
+                message: e,
+                output: String::new(),
+            }
+        }
+    };
+
+    let mut written = 0usize;
+    let mut tokens = 0u64;
+    for (date, scanned_day) in &found {
+        // Keep the existing cost / peak split (the scan cannot produce them).
+        let existing = load_day(&dir.join(format!("{date}.json")), date);
+        let mut merged = scanned_day.clone();
+        merged.total.cost = existing.total.cost.max(merged.total.cost);
+        merged.total.peak_cost = existing.total.peak_cost;
+        merged.total.offpeak_cost = existing.total.offpeak_cost;
+        merged.total.peak_calls = existing.total.peak_calls;
+        for (model, bucket) in merged.by_model.iter_mut() {
+            if let Some(old) = existing.by_model.get(model) {
+                bucket.cost = old.cost.max(bucket.cost);
+                bucket.peak_cost = old.peak_cost;
+                bucket.offpeak_cost = old.offpeak_cost;
+                bucket.peak_calls = old.peak_calls;
+            }
+        }
+        tokens += merged.total.tokens();
+        if save_day(dir, &merged).is_ok() {
+            written += 1;
+        }
+    }
+
+    ActionResult {
+        ok: true,
+        action: "scan".into(),
+        message: format!(
+            "已扫描 {scanned} 个会话文件、{events} 条用量事件，更新 {written} 天（{tokens} token）。\
+             会话日志不含价格，花费沿用已导入的数据。"
+        ),
+        output: String::new(),
+    }
+}
+
+/// Refresh the local store from the session logs (works with no plugin installed).
+///
+/// Merge rule: a day the scanner found data for is *replaced*; days the scanner
+/// did not cover keep whatever is already on disk. That keeps the plugin-imported
+/// history (which carries cost) from being wiped by a scan that cannot see it.
+#[tauri::command]
+fn scan_sessions(app: AppHandle, days: Option<u32>) -> ActionResult {
+    match usage_dir(&app) {
+        Ok(dir) => scan_sessions_at(&dir, days),
+        Err(e) => ActionResult {
+            ok: false,
+            action: "scan".into(),
+            message: e,
+            output: String::new(),
+        },
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Headless diagnostics: `dsh-panel.exe --scan-sessions [file-limit]`.
+    // Handled BEFORE the job-detach step, because detaching exits the process to
+    // relaunch through explorer - which would swallow the diagnostic entirely.
+    // Output goes to a file, not stdout: the Windows GUI subsystem gives this
+    // binary no console, so `println!` would vanish.
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(pos) = argv.iter().position(|a| a == "--scan-sessions") {
+        let limit = argv.get(pos + 1).and_then(|s| s.parse::<usize>().ok());
+        let result = scan_sessions_diag(limit);
+        let out = std::env::temp_dir().join("dsh-panel-scan.txt");
+        let _ = std::fs::write(&out, &result.message);
+        std::process::exit(0);
+    }
+
+    // `dsh-panel.exe --scan-sessions-apply [days]` runs the real refresh.
+    if let Some(pos) = argv.iter().position(|a| a == "--scan-sessions-apply") {
+        let days = argv.get(pos + 1).and_then(|s| s.parse::<u32>().ok());
+        let message = match usage_dir_headless() {
+            Ok(dir) => scan_sessions_at(&dir, days).message,
+            Err(e) => e,
+        };
+        let out = std::env::temp_dir().join("dsh-panel-scan-apply.txt");
+        let _ = std::fs::write(&out, message);
+        std::process::exit(0);
+    }
+
     detach_from_job_if_needed();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -2270,6 +2916,9 @@ pub fn run() {
             get_usage_summary,
             import_plugin_usage,
             usage_series,
+            usage_analysis,
+            scan_sessions,
+            scan_sessions_diag,
             list_plugins,
             install_plugin,
             remove_plugin,

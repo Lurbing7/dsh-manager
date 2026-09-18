@@ -202,7 +202,7 @@ function onMove(e: MouseEvent) {
     >
       <strong>{{ hoverPoint.key }}</strong>
       <span>花费 ¥{{ hoverPoint.cost.toFixed(4) }}</span>
-      <span>令牌 {{ formatTokens(hoverPoint.tokens) }}</span>
+      <span>token {{ formatTokens(hoverPoint.tokens) }}</span>
       <span>调用 {{ hoverPoint.calls }}</span>
     </div>
   </div>
