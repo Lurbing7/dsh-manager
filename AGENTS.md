@@ -13,6 +13,8 @@ cd src-tauri && cargo check    # 只检查 Rust
 npm run tauri build            # 打包
 ```
 
+> **改了图标/做完整重装，用 `scripts/build-and-install.ps1`**，别直接 `npm run tauri build` —— 原因见下面「图标缓存」第 1 条。
+
 **顺序要求**：`cargo build` 之前 `dist/` 必须存在，否则 `tauri::generate_context!()` 编译失败。
 改了前端先 `npm run build`。
 
@@ -21,9 +23,17 @@ npm run tauri build            # 打包
 「嗯…无法访问此页面 / localhost 拒绝连接」——看起来像应用坏了，其实是启动方式错了。
 要独立运行/长期使用必须 `npm run tauri build`（release 内嵌 dist），再跑 `scripts/install.ps1`。
 
-**图标缓存**：Windows 按**路径**缓存 shell 图标且不看文件时间戳，重编译安装后桌面/任务栏可能仍显示旧图标。
-`scripts/install.ps1` 里带了 `ie4uinit -show`，但那**刷不动桌面快捷方式和任务栏按钮**——
-彻底的办法是重启 explorer：`Stop-Process -Name explorer -Force` 然后 `Start-Process explorer`。
+**图标缓存有两层，两层都踩过**：
+
+1. **编译层（更隐蔽）**：`tauri-build` **不会**因为 `icons/icon.ico` 变化而重跑 build script，
+   于是 `npm run tauri build` 一直把**旧图标**打进 exe。实测：`icon.ico` 里已是新图，
+   从 exe 里扒出来的还是上一版。**改图标后必须删掉本 crate 的 build-script 缓存**：
+   `target/release/build/dsh-panel-*` 与 `target/release/.fingerprint/dsh-panel-*`
+   （`cargo clean -p dsh-panel` **不够**）。`scripts/build-and-install.ps1` 已包含这一步。
+   **验证方法**：从 exe 二进制里按 `\x89PNG` 签名扒出所有 PNG，挑 256×256 那张肉眼确认。
+2. **Shell 层**：Windows 按**路径**缓存图标且不看文件时间戳。`ie4uinit -show` 刷不动
+   桌面快捷方式与任务栏按钮——要 `Stop-Process -Name explorer -Force`，
+   再删 `%LOCALAPPDATA%\Microsoft\Windows\Explorer\iconcache*`，然后重启 explorer。
 
 **`scripts/*.ps1` 一律纯 ASCII**（同 workspace 约定）。
 
@@ -79,7 +89,7 @@ npm run tauri build            # 打包
   `clean_artwork()` 两步清理：把近白**中性色**拍平成纯白（去棋盘格，中性判据保护彩色像素）；在右下角把水印破坏的地方补回来。
   水印是**"白色填充 + 浅灰描边"**的文字——白背景上只有灰描边可见（→ 变白），压在深蓝边框上会把边框冲淡（→ 补回边框色）。
   裁剪框 `APP_CROP = (90, 90, 1885)` 是量出来的窗口边缘，不要凭感觉改。
-- **圆角半径必须给足（18%，别用 5%）**：半径按边长比例算，5% 在 1024px 下是 56px 看着挺圆，
+- **圆角半径用 22%**：半径按边长比例算，5% 在 1024px 下是 56px 看着挺圆，
   但缩到 **48px 只剩 2.6px、32px 只剩 1.8px**，抗锯齿会把它抹平成直角——用户看到的就是"图标没圆角"。
   这不是白色背景的问题。**验证方法**：读 `icon.ico` 各尺寸的角落 alpha，必须都是 0。
 

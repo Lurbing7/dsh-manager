@@ -198,7 +198,7 @@ def clean_artwork(img: Image.Image, threshold: int = 244) -> Image.Image:
     return Image.fromarray(a.astype(np.uint8), "RGB")
 
 
-def make_app_icon(size: int = 1024, radius_ratio: float = 0.18) -> Image.Image:
+def make_app_icon(size: int = 1024, radius_ratio: float = 0.22) -> Image.Image:
     """v2 logo pipeline: clean the artwork, crop to the window edge, round the corners.
 
     radius_ratio is a fraction of the short side and needs to be generous: at
