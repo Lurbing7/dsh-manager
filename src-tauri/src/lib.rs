@@ -321,6 +321,51 @@ struct Settings {
     /// not shipped with this panel - it runs from that checkout via
     /// `pnpm run dev:desktop`.
     desktop_source_dir: Option<String>,
+    /// DeepSeek API key, used for the balance query.
+    ///
+    /// Stored in plaintext under the app data dir - the same trust level as the
+    /// harness's own `~/.dsh/.credentials.yaml`, which this falls back to when
+    /// empty. Bring-your-own-key here means the balance keeps working even if
+    /// that file moves or changes format.
+    #[serde(default)]
+    deepseek_api_key: Option<String>,
+}
+
+/// The settings as the UI sees them: never the raw key, only whether one exists
+/// and where it came from.
+#[derive(Serialize, Clone)]
+struct SettingsView {
+    desktop_source_dir: Option<String>,
+    api_key_set: bool,
+    /// Masked key (last 4 characters), so two different keys are tellable apart.
+    api_key_hint: String,
+    /// "panel" (entered here) · "dsh" (harness credential store) · "none"
+    api_key_source: String,
+}
+
+/// Keep the last four characters; enough to identify a key, useless to steal.
+fn mask_key(key: &str) -> String {
+    let count = key.chars().count();
+    if count <= 4 {
+        return "•".repeat(count.max(1));
+    }
+    let tail: String = key.chars().skip(count - 4).collect();
+    format!("••••••{tail}")
+}
+
+/// The key to use for provider calls, and where it came from.
+fn resolve_api_key(app: &AppHandle) -> (Option<String>, &'static str) {
+    let settings = load_settings(app);
+    if let Some(key) = settings
+        .deepseek_api_key
+        .filter(|k| !k.trim().is_empty())
+    {
+        return (Some(key), "panel");
+    }
+    match read_dsh_credential("DEEPSEEK_API_KEY") {
+        Some(key) => (Some(key), "dsh"),
+        None => (None, "none"),
+    }
 }
 
 fn settings_file(app: &AppHandle) -> Option<PathBuf> {
@@ -844,8 +889,35 @@ fn desktop_running() -> bool {
 }
 
 #[tauri::command]
-fn get_settings(app: AppHandle) -> Settings {
-    load_settings(&app)
+fn get_settings(app: AppHandle) -> SettingsView {
+    let settings = load_settings(&app);
+    let (key, source) = resolve_api_key(&app);
+    SettingsView {
+        desktop_source_dir: settings.desktop_source_dir,
+        api_key_set: key.is_some(),
+        api_key_hint: key.as_deref().map(mask_key).unwrap_or_default(),
+        api_key_source: source.to_string(),
+    }
+}
+
+/// Save (or clear) the DeepSeek API key used for balance queries.
+#[tauri::command]
+fn set_api_key(app: AppHandle, key: Option<String>) -> ActionResult {
+    let mut settings = load_settings(&app);
+    settings.deepseek_api_key = key
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty());
+    save_settings(&app, &settings);
+
+    ActionResult {
+        ok: true,
+        action: "settings".into(),
+        message: match settings.deepseek_api_key.as_deref().map(mask_key) {
+            Some(masked) => format!("已保存 API Key（{masked}）"),
+            None => "已清除面板内的 API Key，将回退到 DSH 凭据文件".into(),
+        },
+        output: String::new(),
+    }
 }
 
 /// Save (or clear) the source checkout the desktop app is launched from.
@@ -1899,8 +1971,11 @@ fn read_dsh_credential(name: &str) -> Option<String> {
 ///
 /// The plugin used to do this, but the whole point of the panel owning its own
 /// data is that uninstalling plugins must not remove working features.
+///
+/// Key resolution: the one saved in this panel wins, otherwise the harness
+/// credential store is used. Either way the key never leaves this process.
 #[tauri::command]
-async fn get_balance_native(provider: Option<String>) -> BalanceInfo {
+async fn get_balance_native(app: AppHandle, provider: Option<String>) -> BalanceInfo {
     let provider = provider.unwrap_or_else(|| "deepseek".into());
     let fail = |err: String| BalanceInfo {
         ok: false,
@@ -1913,9 +1988,14 @@ async fn get_balance_native(provider: Option<String>) -> BalanceInfo {
         error: Some(err),
     };
 
-    let Some(key) = read_dsh_credential("DEEPSEEK_API_KEY") else {
-        return fail("在 ~/.dsh/.credentials.yaml 的 refs 里找不到 DEEPSEEK_API_KEY".into());
+    let (key, source) = resolve_api_key(&app);
+    let Some(key) = key else {
+        return fail(
+            "没有可用的 API Key：请在设置里填写，或确认 ~/.dsh/.credentials.yaml 的 refs 里有 DEEPSEEK_API_KEY"
+                .into(),
+        );
     };
+    let _ = source;
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -2285,7 +2365,9 @@ fn usage_analysis(app: AppHandle, days: Option<u32>) -> UsageAnalysis {
             cost: b.cost,
         })
         .collect();
-    session_rows.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
+    // Ranked by tokens, not cost: session logs carry no pricing, so cost is 0
+    // for anything derived from a scan and would make the ordering meaningless.
+    session_rows.sort_by(|a, b| b.tokens.cmp(&a.tokens));
     session_rows.truncate(10);
 
     // Month projection: elapsed days include today.
@@ -2415,10 +2497,16 @@ fn collect_session_usage(
                 .as_str()
                 .unwrap_or("unknown")
                 .to_string();
-            let session = v["data"]["message"]["id"]
-                .as_str()
-                .map(|_| path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string())
-                .unwrap_or_default();
+            // The session id is the *directory* name (`session-<uuid>`); every
+            // file inside is called `session.v3.jsonl.zstd`, so using the file
+            // name would fold every session into one bucket.
+            let session = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .filter(|n| n.starts_with("session"))
+                .unwrap_or("unknown")
+                .to_string();
 
             usage_events += 1;
 
@@ -2656,6 +2744,7 @@ pub fn run() {
             start_harness_inline,
             stop_harness,
             get_settings,
+            set_api_key,
             set_desktop_source_dir,
             start_desktop_app,
             stop_desktop_app,

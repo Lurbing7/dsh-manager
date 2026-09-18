@@ -112,8 +112,8 @@ const donut = computed(() => {
   });
 });
 
-const maxSessionCost = computed(() =>
-  Math.max(...(data.value?.sessions ?? []).map((s) => s.cost), 0.0001),
+const maxSessionTokens = computed(() =>
+  Math.max(...(data.value?.sessions ?? []).map((s) => s.tokens), 1),
 );
 
 /** Shorten a session id for the table; keep the tail which is the unique part. */
@@ -276,15 +276,18 @@ function shortSession(id: string): string {
 
       <!-- top sessions -->
       <section v-if="data.sessions.length" class="panel">
-        <h3>会话消耗排行 Top {{ data.sessions.length }}</h3>
+        <h3>会话消耗排行 Top {{ data.sessions.length }}（按 token）</h3>
         <div v-for="s in data.sessions" :key="s.session" class="session-row">
           <span class="session-id mono ellipsis" :title="s.session">{{ shortSession(s.session) }}</span>
           <div class="session-bar">
-            <span :style="{ width: `${(s.cost / maxSessionCost) * 100}%` }"></span>
+            <span :style="{ width: `${(s.tokens / maxSessionTokens) * 100}%` }"></span>
           </div>
-          <span class="session-meta mono">{{ s.calls }} 次 · {{ fmtTokens(s.tokens) }}</span>
-          <span class="session-cost mono">{{ fmtCost(s.cost) }}</span>
+          <span class="session-meta mono">{{ s.calls }} 次调用</span>
+          <span class="session-cost mono">{{ fmtTokens(s.tokens) }}</span>
         </div>
+        <p class="hint">
+          按 token 排序而不是花费：会话日志只记录 token，不含价格。
+        </p>
       </section>
     </template>
   </div>

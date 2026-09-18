@@ -32,8 +32,14 @@ interface ActionResult {
   output: string;
 }
 
-interface Settings {
+interface SettingsView {
   desktop_source_dir: string | null;
+  /** Whether a key is available from the panel or the harness store. */
+  api_key_set: boolean;
+  /** Masked key, e.g. "••••••a1b2". */
+  api_key_hint: string;
+  /** "panel" | "dsh" | "none" */
+  api_key_source: string;
 }
 
 interface BalanceInfo {
@@ -108,6 +114,10 @@ const bucket = ref<"day" | "week" | "month">("day");
 const analysisRange = ref(30);
 const analysisRef = ref<InstanceType<typeof UsageAnalysis> | null>(null);
 const sourceDir = ref("");
+/** Settings as the backend reports them (API key comes back masked). */
+const settings = ref<SettingsView | null>(null);
+const apiKeyInput = ref("");
+const apiKeyVisible = ref(false);
 const busy = ref<string | null>(null);
 const toast = ref<{ kind: "info" | "ok" | "err"; text: string } | null>(null);
 const logText = ref("");
@@ -181,8 +191,24 @@ async function refreshLocal() {
 
 async function loadSettings() {
   try {
-    const s = await invoke<Settings>("get_settings");
+    const s = await invoke<SettingsView>("get_settings");
+    settings.value = s;
     sourceDir.value = s.desktop_source_dir ?? "";
+  } catch (e) {
+    say("err", String(e));
+  }
+}
+
+/** Save (or clear) the DeepSeek API key, then re-query the balance. */
+async function saveApiKey(clear = false) {
+  try {
+    const r = await invoke<ActionResult>("set_api_key", {
+      key: clear ? null : apiKeyInput.value,
+    });
+    say(r.ok ? "ok" : "err", r.message);
+    if (r.ok) apiKeyInput.value = "";
+    await loadSettings();
+    await refreshBalance();
   } catch (e) {
     say("err", String(e));
   }
@@ -579,6 +605,14 @@ onUnmounted(() => {
         <button class="ghost" title="重新载入数据" @click="refreshSeries">刷新</button>
       </header>
 
+      <section v-if="settings && !settings.api_key_set" class="setup-banner">
+        <div class="setup-text">
+          <strong>还没有可用的 DeepSeek API Key</strong>
+          <p>余额查询需要它。填一次就行，之后可以随时在设置里改。</p>
+        </div>
+        <button class="accent" @click="drawerOpen = true">去填写</button>
+      </section>
+
       <section class="stats">
         <div class="stat stat-primary">
           <span class="stat-label">本月花费</span>
@@ -689,6 +723,43 @@ onUnmounted(() => {
               <span v-if="busy === 'upgrade'" class="spinner"></span>一键升级
             </button>
           </div>
+        </section>
+
+        <!-- api key -->
+        <section class="panel">
+          <h3>DeepSeek API Key</h3>
+          <p class="hint">
+            <template v-if="settings?.api_key_set">
+              当前：
+              <code>{{ settings.api_key_hint }}</code>
+              <template v-if="settings.api_key_source === 'dsh'">
+                （来自 DSH 凭据文件）
+              </template>
+              <template v-else>（面板内保存的）</template>
+            </template>
+            <template v-else>尚未配置。不填就只能靠 DSH 凭据文件，那个文件没了余额就查不了。</template>
+          </p>
+          <div class="field">
+            <input
+              v-model="apiKeyInput"
+              class="input mono"
+              :type="apiKeyVisible ? 'text' : 'password'"
+              spellcheck="false"
+              placeholder="sk-...（留空则不修改）"
+              @keyup.enter="saveApiKey()"
+            />
+            <button class="btn-sm" @click="apiKeyVisible = !apiKeyVisible">
+              {{ apiKeyVisible ? "隐藏" : "显示" }}
+            </button>
+          </div>
+          <div class="btn-row">
+            <button class="accent" :disabled="!apiKeyInput.trim()" @click="saveApiKey()">保存</button>
+            <button v-if="settings?.api_key_source === 'panel'" @click="saveApiKey(true)">清除（回退到凭据文件）</button>
+          </div>
+          <p class="hint">
+            保存在 <code>%APPDATA%\com.dshpanel.app\settings.json</code>，明文存储 ——
+            与 DSH 自己的凭据文件同一信任级别。面板内的 key 优先于凭据文件。
+          </p>
         </section>
 
         <!-- desktop app -->
