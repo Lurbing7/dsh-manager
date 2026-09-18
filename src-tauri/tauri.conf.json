@@ -15,9 +15,10 @@
         "title": "DSH Panel",
         "label": "main",
         "width": 440,
-        "height": 580,
+        "height": 620,
         "resizable": false,
-        "center": true
+        "center": true,
+        "backgroundColor": "#fafafa"
       }
     ],
     "security": {
