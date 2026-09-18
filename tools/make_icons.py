@@ -129,17 +129,24 @@ def make_thick_line(im: Image.Image, work: int = 256, thresh: int = 205, grow: i
     return Image.fromarray(rgba, "RGBA")
 
 
-def render_tray(kind: str, size: int = 256) -> Image.Image:
-    """White silhouette on a coloured disc - readable on light AND dark taskbars."""
-    meta = SOURCES[kind]
+# Tray colours sit ALONGSIDE the built-in Windows icons rather than on top of
+# them: one flat colour, transparent background, no disc. The taskbar supplies
+# the contrast, exactly like the volume / battery glyphs do.
+TRAY_COLORS = {
+    ("stopped", "dark"): (154, 160, 166),   # dim grey on a dark taskbar
+    ("running", "dark"): ACCENT,            # DeepSeek blue
+    ("stopped", "light"): (107, 114, 128),  # mid grey on a light taskbar
+    ("running", "light"): ACCENT,
+}
+
+
+def render_tray(state: str, theme: str = "dark", size: int = 32) -> Image.Image:
+    """Flat single-colour silhouette with a transparent background."""
+    meta = SOURCES[state]
     sil = make_silhouette(load_crop(meta["file"], meta["crop"]))
-    ss = 4  # supersample for a smooth disc edge
-    big = Image.new("RGBA", (size * ss, size * ss), (0, 0, 0, 0))
-    ImageDraw.Draw(big).ellipse((0, 0, size * ss - 1, size * ss - 1), fill=DISC[kind] + (255,))
-    inner = int(size * ss * 0.72)
-    off = (size * ss - inner) // 2
-    big.alpha_composite(sil.resize((inner, inner), Image.LANCZOS), (off, off))
-    return big.resize((size, size), Image.LANCZOS)
+    tinted = Image.new("RGBA", sil.size, TRAY_COLORS[(state, theme)] + (255,))
+    tinted.putalpha(sil.split()[3])
+    return tinted.resize((size, size), Image.LANCZOS)
 
 
 def clean_artwork(img: Image.Image, threshold: int = 244) -> Image.Image:
@@ -226,7 +233,7 @@ def preview() -> None:
         crop = load_crop(meta["file"], meta["crop"])
         sil = make_silhouette(crop)
         thick = make_thick_line(crop)
-        tray = render_tray(key)
+        tray = render_tray(key, "dark", 256)
 
         y = pad + row * (cell + pad + label_h)
         sheet.paste(crop.resize((cell, cell), Image.LANCZOS), (pad, y))
@@ -256,15 +263,14 @@ def build() -> None:
     out = ROOT / "src-tauri" / "icons-tray"
     out.mkdir(parents=True, exist_ok=True)
 
-    ico_sizes = [(16, 16), (20, 20), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
-    for kind in SOURCES:
-        art = render_tray(kind, 256)
-        ico = out / f"{kind}.ico"
-        art.save(ico, format="ICO", sizes=ico_sizes)
-        # PNG for the tray at runtime: 64px scales down cleanly to the 16/20/24/32
-        # px sizes Windows actually renders, without the mush a 256px source gives.
-        art.resize((64, 64), Image.LANCZOS).save(out / f"{kind}.png")
-        print(f"{ico.name:<14} {ico.stat().st_size:>7} bytes")
+    # Four flat silhouettes: state x taskbar theme. 32px is the sweet spot for the
+    # 16/20/24 px sizes Windows actually renders in the tray.
+    for state in ("stopped", "running"):
+        for theme in ("dark", "light"):
+            art = render_tray(state, theme, 32)
+            p = out / f"tray-{state}-{theme}.png"
+            art.save(p)
+            print(f"{p.name:<26} {p.stat().st_size:>6} bytes")
 
     app = make_app_icon()
     app_path = ROOT / "src-tauri" / "app-icon.png"
