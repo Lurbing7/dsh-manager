@@ -28,7 +28,8 @@ DeepSeek Harness 的 Windows 桌面小面板：常驻托盘，只做两件事—
 
 ## 图标
 
-**应用图标**：`src-tauri/icons/`，由 `src-tauri/app-icon.png` 经 `npm run tauri icon` 生成（鲸鱼娘 logo，已裁掉右下角水印）。
+**应用图标**：`src-tauri/icons/`，由 `src-tauri/app-icon.png` 经 `npm run tauri icon` 生成。
+源图是 **v2 logo**（`tools/source/logo-v2.png`，蓝白细边框窗口 + 圆点 + 搜索栏，人物更大）。
 
 **托盘图标**：两张，按 harness 是否在运行自动切换，每 10 秒探测一次 `127.0.0.1:3080`（只在状态翻转时重绘并通知界面）：
 
@@ -42,12 +43,21 @@ DeepSeek Harness 的 Windows 桌面小面板：常驻托盘，只做两件事—
 源图在 `tools/source/`，生成脚本：
 
 ```powershell
-python tools\make_icons.py preview              # 出对比预览图（tools/preview/，已 gitignore）
-python tools\make_icons.py build                # 生成托盘 ico/png + 应用图标源图
-npm run tauri icon src-tauri\app-icon.png       # 生成全套应用图标
+python tools\make_icons.py preview              # 对比预览图（tools/preview/，已 gitignore）
+python tools\make_icons.py build                # 托盘 ico/png + 应用图标源图 app-icon.png
+python tools\make_icons.py backup               # 圆角化 logo 备份到下载目录（单文件，只读源图）
+npm run tauri icon src-tauri\app-icon.png       # 从 app-icon.png 生成全套应用图标
 ```
 
-> ⚠️ **源图是开放式线稿**（头发与脸、手与杯子的交界处轮廓有缺口），直接做泛洪填充会从缺口渗进去、填不出剪影。脚本先做**形态学闭运算**（膨胀封口再腐蚀还原）才填充。而且线稿直接缩小到 16px 会**完全消失**（线条只有 1–2 像素宽），必须转成实心剪影。
+### 两处必须知道的图像处理
+
+**① 托盘线稿要先"封闭轮廓"再填充。** `tools/source/tray-*.png` 是开放式线稿（头发与脸、手与杯子的交界处轮廓有缺口），直接泛洪填充会从缺口渗进去、填不出剪影 → 先做**形态学闭运算**（膨胀封口再腐蚀还原）。而且线稿线条只有 1–2 像素宽，直接缩到 16px 会**完全消失**，必须转成实心剪影。
+
+**② v2 logo 要清掉假背景和水印。** `clean_artwork()` 做两件事：
+- 源图铺了一层**假的"透明棋盘格"**（255 和 247–250 交替）→ 把接近白色的**中性色**像素拍平成纯白（中性判据保证头发、花边这些彩色像素不受影响）
+- 右下角有豆包水印，它是**"白色填充 + 浅灰描边"**的文字——压在白色背景上只有灰描边可见，压在深蓝边框上则把边框冲淡 → 分两路处理：灰描边直接变白，被冲淡的蓝色描边补回边框色
+
+裁剪框 `APP_CROP = (90, 90, 1885)` 是从源图量出来的窗口边缘，圆角由 `rounded()` 施加。
 
 ## 技术栈
 

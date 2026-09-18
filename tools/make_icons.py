@@ -42,10 +42,11 @@ SOURCES = {
     },
 }
 
-# App icon: the full logo, cropped to drop the "AI generated" watermark in the
-# bottom-right corner.
-APP_SOURCE = "logo.png"
-APP_CROP = (150, 150, 1650)
+# App icon source. v2 (2026-09-18) is the blue-and-white window with the
+# character; its crop box is measured from the artwork (the window edge), which
+# also cuts off the "AI generated" watermark sitting outside the bottom-right.
+APP_SOURCE = "logo-v2.png"
+APP_CROP = (90, 90, 1885)
 
 
 # --------------------------------------------------------------------------
@@ -141,10 +142,55 @@ def render_tray(kind: str, size: int = 256) -> Image.Image:
     return big.resize((size, size), Image.LANCZOS)
 
 
+def clean_artwork(img: Image.Image, threshold: int = 244) -> Image.Image:
+    """Two cleanups on the v2 artwork.
+
+    1. The art is painted on a fake-transparency checkerboard whose two tones are
+       255 and ~247-250. Snap every near-white NEUTRAL pixel to pure white, so the
+       background reads as flat white instead of a grid. (The neutral test keeps
+       coloured pixels - hair, trim - untouched.)
+    2. The "AI generated" watermark is a translucent WHITE overlay. On the white
+       background it is invisible, but where it crosses the dark blue frame strokes
+       it washes them out into light blue. In that bottom-right corner we darken
+       those washed-out bluish pixels back to the frame colour.
+    """
+    a = np.asarray(img.convert("RGB")).astype(np.int16)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+
+    # 1) checkerboard -> pure white
+    neutral = (a.max(axis=2) - a.min(axis=2)) <= 6
+    a[neutral & (lum >= threshold)] = (255, 255, 255)
+
+    # 2) the watermark corner. The mark is white text with a light-grey outline:
+    #    on the white background only the grey outline shows, and where it crosses
+    #    the dark blue frame strokes it washes them out to light blue.
+    y0, y1, x0, x1 = 1850, 2010, 1640, 2010
+    zone = a[y0:y1, x0:x1]
+    zl = lum[y0:y1, x0:x1]
+    zr, zb = zone[..., 0], zone[..., 2]
+    zmax, zmin = zone.max(axis=2), zone.min(axis=2)
+
+    # 2a) grey outline on white background -> white
+    grey_marks = ((zmax - zmin) <= 22) & (zl >= 175) & (zl < 243)
+    zone[grey_marks] = (255, 255, 255)
+
+    # 2b) washed-out blue frame strokes -> frame colour
+    dark = zone[(zl < 110) & (zb - zr > 8)]
+    if len(dark) > 20:
+        frame = np.median(dark, axis=0).astype(np.int16)
+        washed = (zb - zr > 22) & (zl >= 110) & (zl < 242)
+        zone[washed] = frame
+
+    return Image.fromarray(a.astype(np.uint8), "RGB")
+
+
 def make_app_icon(size: int = 1024) -> Image.Image:
-    im = Image.open(SOURCE / APP_SOURCE).convert("RGB")
+    """v2 logo pipeline: clean the artwork, crop to the window edge, round the corners."""
+    im = clean_artwork(Image.open(SOURCE / APP_SOURCE))
     x, y, s = APP_CROP
-    return im.crop((x, y, x + s, y + s)).resize((size, size), Image.LANCZOS)
+    im = im.crop((x, y, x + s, y + s))
+    return rounded(im, 0.055).resize((size, size), Image.LANCZOS)
 
 
 # --------------------------------------------------------------------------
@@ -241,41 +287,24 @@ def rounded(img: Image.Image, radius_ratio: float) -> Image.Image:
 
 
 def backup_logo() -> None:
-    """Write rounded, de-framed variants of the logo into the Downloads folder.
+    """Write the polished logo into Downloads as a backup file.
 
-    The artwork has two nested frames:
-      layer 1  the outer white margin plus a thin blue rounded outline (the image edge)
-      layer 2  the blue browser window (title bar, window buttons, address bar)
-    Both variants below are 1024x1024 PNG with a rounded alpha mask. The source
-    file is never modified - these are new files next to it.
+    Pipeline: flatten the fake-transparency checkerboard, crop to the window edge
+    (which drops the watermark outside the bottom-right corner), round the
+    corners, 1024x1024. The source artwork is never modified - this writes a new
+    file next to it.
     """
-    src = Image.open(SOURCE / APP_SOURCE).convert("RGB")
     out_dir = Path.home() / "Downloads"
     out_dir.mkdir(parents=True, exist_ok=True)
+    PREVIEW.mkdir(parents=True, exist_ok=True)
 
-    # A: drop layer 1 only - keep the blue browser window intact.
-    a = src.crop((186, 188, 1854, 1855))
-    a = rounded(a, 0.05).resize((1024, 1024), Image.LANCZOS)
-    a_path = out_dir / "dsh-panel-logo-A-keep-browser-window-1024.png"
-    a.save(a_path)
-    print(f"saved {a_path}")
+    icon = make_app_icon(1024)
+    p = out_dir / "dsh-panel-logo-v2-rounded-1024.png"
+    icon.save(p)
+    print(f"saved   {p}")
 
-    # B: drop layer 2 as well - keep only the character and the inner frame.
-    # Cropped to a square centred on the character; the ahoge (hair strand) pokes
-    # up into the title bar, so it is necessarily cut here.
-    b = src.crop((387, 565, 387 + 1265, 565 + 1265))
-    b = rounded(b, 0.07).resize((1024, 1024), Image.LANCZOS)
-    b_path = out_dir / "dsh-panel-logo-B-no-windows-1024.png"
-    b.save(b_path)
-    print(f"saved {b_path}")
-
-    # Side-by-side so the choice is easy.
-    sheet = Image.new("RGB", (1024 * 2 + 30, 1024 + 30), (240, 241, 244))
-    sheet.paste(a.convert("RGB"), (10, 10))
-    sheet.paste(b.convert("RGB"), (1024 + 20, 10))
-    sheet_path = out_dir / "dsh-panel-logo-compare.png"
-    sheet.save(sheet_path)
-    print(f"saved {sheet_path}")
+    icon.resize((256, 256), Image.LANCZOS).save(PREVIEW / "logo-v2-preview.png")
+    print(f"preview {PREVIEW / 'logo-v2-preview.png'}")
 
 
 def main() -> None:
