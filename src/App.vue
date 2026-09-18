@@ -3,6 +3,8 @@ import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import UsageChart from "./components/UsageChart.vue";
+import type { UsagePoint } from "./types";
 
 interface LocalInfo {
   ok: boolean;
@@ -44,21 +46,17 @@ interface BalanceInfo {
   error: string | null;
 }
 
-interface ModelUsage {
-  model: string;
-  tokens: number;
-  cost: number;
-}
-
-interface UsageSummary {
+interface UsageSeries {
   ok: boolean;
-  day_tokens: number;
-  day_cost: number;
-  week_tokens: number;
-  week_cost: number;
+  bucket: string;
+  points: UsagePoint[];
   total_cost: number;
-  requests: number;
-  by_model: ModelUsage[];
+  total_tokens: number;
+  total_calls: number;
+  month_cost: number;
+  month_tokens: number;
+  month_calls: number;
+  filled: number;
   error: string | null;
 }
 
@@ -102,32 +100,25 @@ const HARNESS_PORT = 3080;
 
 const local = ref<LocalInfo | null>(null);
 const update = ref<UpdateInfo | null>(null);
-/** Desktop app source checkout, bound to the input box. */
+const balance = ref<BalanceInfo | null>(null);
+const series = ref<UsageSeries | null>(null);
+const bucket = ref<"day" | "week" | "month">("day");
 const sourceDir = ref("");
 const busy = ref<string | null>(null);
 const toast = ref<{ kind: "info" | "ok" | "err"; text: string } | null>(null);
 const logText = ref("");
-/** null = not known yet (the poller fills it in within one tick). */
 const harnessUp = ref<boolean | null>(null);
-/** Whether the desktop app the panel launched is still alive. */
 const desktopUp = ref(false);
-/** Live console output from whatever the panel launched. */
 const termLines = ref<string[]>([]);
 const termEl = ref<HTMLElement | null>(null);
-/** Usage-plugin data (balance + token/cost summary). */
-const balance = ref<BalanceInfo | null>(null);
-const usage = ref<UsageSummary | null>(null);
-let usageTimer: number | null = null;
-/** Plugin management: profiles and their third-party packages. */
+const drawerOpen = ref(false);
 const profiles = ref<ProfilePlugins[]>([]);
 const activeProfile = ref("web");
 const newPlugin = ref("");
-/** Feishu → dsh bridge. */
 const bridgeRunning = ref(false);
 const bridgeUsers = ref("");
-const bridgeProfile = ref("headless");
-/** Hermes gateway (read-only). */
 const hermes = ref<HermesStatus | null>(null);
+let usageTimer: number | null = null;
 
 let unlisten: UnlistenFn | null = null;
 let unlistenHarness: UnlistenFn | null = null;
@@ -139,13 +130,14 @@ function say(kind: "info" | "ok" | "err", text: string) {
 
 async function appendTerm(line: string) {
   termLines.value.push(line);
-  // keep the buffer bounded - a desktop build is chatty
   if (termLines.value.length > 400) {
     termLines.value.splice(0, termLines.value.length - 400);
   }
   await nextTick();
   if (termEl.value) termEl.value.scrollTop = termEl.value.scrollHeight;
 }
+
+/* ---------- data ---------- */
 
 async function refreshLocal() {
   try {
@@ -155,25 +147,232 @@ async function refreshLocal() {
   }
 }
 
-/** Balance from the usage plugin (it queries the provider, e.g. DeepSeek). */
+async function loadSettings() {
+  try {
+    const s = await invoke<Settings>("get_settings");
+    sourceDir.value = s.desktop_source_dir ?? "";
+  } catch (e) {
+    say("err", String(e));
+  }
+}
+
+async function saveSourceDir() {
+  try {
+    const r = await invoke<ActionResult>("set_desktop_source_dir", {
+      dir: sourceDir.value.trim() || null,
+    });
+    if (!r.ok) say("err", r.message);
+    await loadSettings();
+  } catch (e) {
+    say("err", String(e));
+  }
+}
+
 async function refreshBalance() {
   try {
     balance.value = await invoke<BalanceInfo>("get_balance", { provider: "deepseek" });
-  } catch (e) {
-    balance.value = { ok: false, provider: "deepseek", currency: "", total: "", topped_up: "", granted: "", queried_at: 0, error: String(e) };
+  } catch {
+    balance.value = null;
   }
 }
 
-/** Token/cost summary, aggregated in Rust (the raw record list is ~1.9 MB). */
-async function refreshUsage() {
+async function refreshSeries() {
   try {
-    usage.value = await invoke<UsageSummary>("get_usage_summary", { days: 7 });
+    series.value = await invoke<UsageSeries>("usage_series", {
+      bucket: bucket.value,
+      count: bucket.value === "day" ? 7 : bucket.value === "week" ? 8 : 12,
+    });
   } catch (e) {
-    usage.value = { ok: false, day_tokens: 0, day_cost: 0, week_tokens: 0, week_cost: 0, total_cost: 0, requests: 0, by_model: [], error: String(e) };
+    series.value = null;
+    say("err", String(e));
   }
 }
 
-/** Read every profile's installed third-party plugins. */
+async function setBucket(next: "day" | "week" | "month") {
+  bucket.value = next;
+  await refreshSeries();
+}
+
+async function importUsage() {
+  busy.value = "import";
+  try {
+    const r = await invoke<ActionResult>("import_plugin_usage");
+    say(r.ok ? "ok" : "err", r.message);
+    await refreshSeries();
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
+  }
+}
+
+const checkedText = computed(() => {
+  const t = update.value?.checked_at;
+  if (!t) return "从未检查";
+  return new Date(t * 1000).toLocaleString("zh-CN", { hour12: false });
+});
+
+const statusText = computed(() => {
+  if (!update.value) return "未检查";
+  if (!update.value.ok) return "检查失败";
+  return update.value.has_update ? `可更新 ${update.value.latest_version}` : "已是最新";
+});
+
+const statusClass = computed(() => {
+  if (!update.value) return "unknown";
+  if (!update.value.ok) return "err";
+  return update.value.has_update ? "warn" : "ok";
+});
+
+const harnessText = computed(() =>
+  harnessUp.value === null ? "检测中…" : harnessUp.value ? "运行中" : "未启动",
+);
+
+const balanceText = computed(() => {
+  if (!balance.value) return "—";
+  if (!balance.value.ok) return "查询失败";
+  return `${balance.value.currency} ${balance.value.total}`;
+});
+
+/** Curve summary line under the chart. */
+const rangeText = computed(() => {
+  if (!series.value?.ok) return "";
+  const label = bucket.value === "day" ? "近 7 天" : bucket.value === "week" ? "近 8 周" : "近 12 个月";
+  return `${label}合计 ¥${series.value.total_cost.toFixed(2)} · ${series.value.total_calls.toLocaleString()} 次调用`;
+});
+
+const currentProfile = computed(
+  () => profiles.value.find((p) => p.profile === activeProfile.value) ?? null,
+);
+
+/* ---------- actions ---------- */
+
+async function checkUpdate() {
+  busy.value = "check";
+  say("info", "正在查询 registry…");
+  try {
+    const r = await invoke<UpdateInfo>("check_update");
+    update.value = r;
+    if (!r.ok) say("err", r.error ?? "检查失败");
+    else if (r.has_update) say("ok", `发现新版本 ${r.latest_version}`);
+    else say("ok", "已是最新版本");
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
+  }
+}
+
+async function upgrade() {
+  busy.value = "upgrade";
+  say("info", "正在升级 dsh，请稍候…（npm 装包通常要几十秒）");
+  try {
+    const r = await invoke<ActionResult>("upgrade_dsh");
+    logText.value = r.output;
+    say(r.ok ? "ok" : "err", r.message);
+    await refreshLocal();
+    if (r.ok) await checkUpdate();
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
+  }
+}
+
+async function startHarnessWeb() {
+  busy.value = "harness";
+  try {
+    const r = await invoke<ActionResult>("start_harness_inline", { port: HARNESS_PORT });
+    say(r.ok ? "ok" : "err", r.message);
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
+  }
+}
+
+async function stopHarnessWeb() {
+  busy.value = "stop";
+  try {
+    const r = await invoke<ActionResult>("stop_harness", { port: HARNESS_PORT });
+    say(r.ok ? "ok" : "err", r.message);
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
+  }
+}
+
+/** The floating action: one button that is start-or-stop depending on state. */
+async function toggleHarness() {
+  if (harnessUp.value) await stopHarnessWeb();
+  else await startHarnessWeb();
+}
+
+async function openPage() {
+  try {
+    const r = await invoke<ActionResult>("open_harness_page", { port: HARNESS_PORT });
+    say(r.ok ? "ok" : "err", r.message);
+  } catch (e) {
+    say("err", String(e));
+  }
+}
+
+async function pickSourceDir() {
+  try {
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      title: "选择 DeepSeek Harness 源码根目录",
+    });
+    if (typeof picked !== "string") return;
+    sourceDir.value = picked;
+    await saveSourceDir();
+  } catch (e) {
+    say("err", String(e));
+  }
+}
+
+async function refreshDesktopState() {
+  try {
+    desktopUp.value = await invoke<boolean>("desktop_running");
+  } catch {
+    /* label only */
+  }
+}
+
+async function startDesktop() {
+  busy.value = "desktop";
+  await saveSourceDir();
+  if (!sourceDir.value.trim()) {
+    busy.value = null;
+    say("err", "先填源码目录，或点「浏览…」选一个");
+    return;
+  }
+  try {
+    const r = await invoke<ActionResult>("start_desktop_app");
+    say(r.ok ? "ok" : "err", r.message);
+    if (r.ok) desktopUp.value = true;
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
+  }
+}
+
+async function stopDesktop() {
+  busy.value = "stop";
+  try {
+    const r = await invoke<ActionResult>("stop_desktop_app");
+    say(r.ok ? "ok" : "err", r.message);
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
+    await refreshDesktopState();
+  }
+}
+
 async function refreshPlugins() {
   try {
     profiles.value = await invoke<ProfilePlugins[]>("list_plugins");
@@ -183,48 +382,6 @@ async function refreshPlugins() {
     }
   } catch (e) {
     say("err", String(e));
-  }
-}
-
-const currentProfile = computed(
-  () => profiles.value.find((p) => p.profile === activeProfile.value) ?? null,
-);
-
-/** Whether the Feishu → dsh bridge process is alive. */
-async function refreshBridge() {
-  try {
-    bridgeRunning.value = (await invoke<BridgeStatus>("feishu_bridge_status")).running;
-  } catch {
-    // only affects the button label
-  }
-}
-
-async function startBridge() {
-  busy.value = "feishu";
-  try {
-    const r = await invoke<ActionResult>("feishu_bridge_start", {
-      allowedUsers: bridgeUsers.value,
-      profile: bridgeProfile.value,
-    });
-    say(r.ok ? "ok" : "err", r.message);
-  } catch (e) {
-    say("err", String(e));
-  } finally {
-    busy.value = null;
-    await refreshBridge();
-  }
-}
-
-async function stopBridge() {
-  busy.value = "feishu";
-  try {
-    const r = await invoke<ActionResult>("feishu_bridge_stop");
-    say(r.ok ? "ok" : "err", r.message);
-  } catch (e) {
-    say("err", String(e));
-  } finally {
-    busy.value = null;
-    await refreshBridge();
   }
 }
 
@@ -276,68 +433,48 @@ async function upgradePlugins() {
   }
 }
 
-/** One-shot: pull the plugin's full record list into our own per-day store.
- *  Must run while the plugin is still installed - it is the only source of
- *  history that already carries cost figures. */
-async function importUsage() {
-  busy.value = "import";
-  say("info", "正在从插件导入历史用量…");
+async function refreshBridge() {
   try {
-    const r = await invoke<ActionResult>("import_plugin_usage");
-    say(r.ok ? "ok" : "err", r.message);
-    await refreshUsage();
-  } catch (e) {
-    say("err", String(e));
-  } finally {
-    busy.value = null;
+    bridgeRunning.value = (await invoke<BridgeStatus>("feishu_bridge_status")).running;
+  } catch {
+    /* label only */
   }
 }
 
-async function loadSettings() {
+async function startBridge() {
+  busy.value = "feishu";
   try {
-    const s = await invoke<Settings>("get_settings");
-    sourceDir.value = s.desktop_source_dir ?? "";
-  } catch (e) {
-    say("err", String(e));
-  }
-}
-
-/** Persist whatever the input box currently holds (empty clears it). */
-async function saveSourceDir() {
-  try {
-    const r = await invoke<ActionResult>("set_desktop_source_dir", {
-      dir: sourceDir.value.trim() || null,
+    const r = await invoke<ActionResult>("feishu_bridge_start", {
+      allowedUsers: bridgeUsers.value,
+      profile: "headless",
     });
-    if (!r.ok) say("err", r.message);
-    await loadSettings();
-  } catch (e) {
-    say("err", String(e));
-  }
-}
-
-async function checkUpdate() {
-  busy.value = "check";
-  say("info", "正在查询 registry…");
-  try {
-    const r = await invoke<UpdateInfo>("check_update");
-    update.value = r;
-    if (!r.ok) say("err", r.error ?? "检查失败");
-    else if (r.has_update) say("ok", `发现新版本 ${r.latest_version}`);
-    else say("ok", "已是最新版本");
+    say(r.ok ? "ok" : "err", r.message);
   } catch (e) {
     say("err", String(e));
   } finally {
     busy.value = null;
+    await refreshBridge();
   }
 }
 
-/** Read the Hermes gateway state file (never writes to it). */
+async function stopBridge() {
+  busy.value = "feishu";
+  try {
+    const r = await invoke<ActionResult>("feishu_bridge_stop");
+    say(r.ok ? "ok" : "err", r.message);
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
+    await refreshBridge();
+  }
+}
+
 async function refreshHermes() {
   try {
     hermes.value = await invoke<HermesStatus>("hermes_status");
-  } catch (e) {
+  } catch {
     hermes.value = null;
-    say("err", String(e));
   }
 }
 
@@ -350,199 +487,55 @@ async function openHermes() {
   }
 }
 
-/** Reopen the harness web UI - the way back after closing the browser tab. */
-async function openPage() {
-  try {
-    const r = await invoke<ActionResult>("open_harness_page", { port: HARNESS_PORT });
-    say(r.ok ? "ok" : "err", r.message);
-  } catch (e) {
-    say("err", String(e));
-  }
-}
-
-/** Start the dsh WEB harness inside the panel (no separate console window). */
-async function startHarnessWeb() {
-  busy.value = "harness";
-  say("info", "正在确认 Web 端是否在运行…");
-  try {
-    const r = await invoke<ActionResult>("start_harness_inline", { port: HARNESS_PORT });
-    say(r.ok ? "ok" : "err", r.message);
-  } catch (e) {
-    say("err", String(e));
-  } finally {
-    busy.value = null;
-  }
-}
-
-/** Stop whatever serves the harness port - panel-launched or not. */
-async function stopHarnessWeb() {
-  busy.value = "stop";
-  say("info", "正在停止 Web 端…");
-  try {
-    const r = await invoke<ActionResult>("stop_harness", { port: HARNESS_PORT });
-    say(r.ok ? "ok" : "err", r.message);
-  } catch (e) {
-    say("err", String(e));
-  } finally {
-    busy.value = null;
-  }
-}
-
-async function toggleHarness() {
-  if (harnessUp.value) await stopHarnessWeb();
-  else await startHarnessWeb();
-}
-
-/** Pick the source root with a folder dialog, then persist it. */
-async function pickSourceDir() {
-  try {
-    const picked = await open({
-      directory: true,
-      multiple: false,
-      title: "选择 DeepSeek Harness 源码根目录",
-    });
-    if (typeof picked !== "string") return;
-    sourceDir.value = picked;
-    await saveSourceDir();
-  } catch (e) {
-    say("err", String(e));
-  }
-}
-
-async function refreshDesktopState() {
-  try {
-    desktopUp.value = await invoke<boolean>("desktop_running");
-  } catch {
-    // ignore - only affects the button label
-  }
-}
-
-/** Start the Electron DESKTOP app from the configured source checkout. */
-async function startDesktop() {
-  busy.value = "desktop";
-  // persist any edit made in the input box before launching
-  await saveSourceDir();
-  if (!sourceDir.value.trim()) {
-    busy.value = null;
-    say("err", "先填源码目录，或点「浏览…」选一个");
-    return;
-  }
-  say("info", "正在从源码启动 Electron 桌面端…");
-  try {
-    const r = await invoke<ActionResult>("start_desktop_app");
-    say(r.ok ? "ok" : "err", r.message);
-    if (r.ok) desktopUp.value = true;
-  } catch (e) {
-    say("err", String(e));
-  } finally {
-    busy.value = null;
-  }
-}
-
-async function stopDesktop() {
-  busy.value = "stop";
-  try {
-    const r = await invoke<ActionResult>("stop_desktop_app");
-    say(r.ok ? "ok" : "err", r.message);
-  } catch (e) {
-    say("err", String(e));
-  } finally {
-    busy.value = null;
-    await refreshDesktopState();
-  }
-}
-
-async function toggleDesktop() {
-  if (desktopUp.value) await stopDesktop();
-  else await startDesktop();
-}
-
-async function upgrade() {
-  busy.value = "upgrade";
-  say("info", "正在升级 dsh，请稍候…（npm 装包通常要几十秒）");
-  try {
-    const r = await invoke<ActionResult>("upgrade_dsh");
-    logText.value = r.output;
-    say(r.ok ? "ok" : "err", r.message);
-    await refreshLocal();
-    if (r.ok) await checkUpdate();
-  } catch (e) {
-    say("err", String(e));
-  } finally {
-    busy.value = null;
-  }
-}
-
 async function quit() {
   await invoke("quit_app");
 }
-
-const checkedText = computed(() => {
-  const t = update.value?.checked_at;
-  if (!t) return "从未检查";
-  return new Date(t * 1000).toLocaleString("zh-CN", { hour12: false });
-});
-
-const statusClass = computed(() => {
-  if (!update.value) return "unknown";
-  if (!update.value.ok) return "err";
-  return update.value.has_update ? "warn" : "ok";
-});
-
-const statusText = computed(() => {
-  if (!update.value) return "未检查";
-  if (!update.value.ok) return "检查失败";
-  return update.value.has_update ? "有可用更新" : "已是最新";
-});
-
-const harnessText = computed(() => (harnessUp.value ? "运行中" : "未启动"));
-const webBusy = computed(() => busy.value === "harness" || busy.value === "stop");
 
 onMounted(async () => {
   await refreshLocal();
   await loadSettings();
   await refreshDesktopState();
-  // Fired by the background daily sweep and the tray menu.
+  await refreshBalance();
+  await refreshSeries();
+
+  // First run: seed the local store from the plugin while it is still installed.
+  try {
+    if ((series.value?.filled ?? 0) === 0) {
+      const r = await invoke<ActionResult>("import_plugin_usage");
+      if (r.ok) {
+        say("ok", r.message);
+        await refreshSeries();
+      }
+    }
+  } catch {
+    /* no plugin / no harness - the chart just stays empty */
+  }
+
   unlisten = await listen<UpdateInfo>("update-checked", (e) => {
     update.value = e.payload;
   });
-  // Fired by the harness port poller (the same one that switches the tray icon).
   unlistenHarness = await listen<boolean>("harness-state", (e) => {
     harnessUp.value = e.payload;
   });
-  // stdout/stderr of whatever the panel started.
   unlistenTerm = await listen<string>("harness-output", (e) => {
     void appendTerm(e.payload);
   });
+
   try {
     harnessUp.value = await invoke<boolean>("harness_running");
   } catch {
-    // the poller will fill this in on its next tick
+    /* poller will fill it */
   }
+
   await checkUpdate();
-  // Usage/balance come from the harness plugin; refresh on open and every 60s
-  // (a balance query hits the provider API, so don't hammer it).
-  await refreshBalance();
-  await refreshUsage();
-  // First run (or after the plugins get uninstalled): seed our own store from
-  // the plugin once, while it is still there. Silently skipped when unavailable.
-  try {
-    const probe = await invoke<{ filled: number }>("usage_series", { bucket: "day", count: 7 });
-    if (probe.filled === 0) {
-      const r = await invoke<ActionResult>("import_plugin_usage");
-      if (r.ok) say("ok", r.message);
-    }
-  } catch {
-    // no harness / no plugin - the chart simply stays empty
-  }
   await refreshPlugins();
   await refreshBridge();
   await refreshHermes();
+
+  // Balance costs a real provider call; the chart only needs local files.
   usageTimer = window.setInterval(() => {
-    if (harnessUp.value) {
-      void refreshBalance();
-      void refreshUsage();
-    }
+    void refreshSeries();
+    if (harnessUp.value) void refreshBalance();
   }, 60000);
 });
 
@@ -555,291 +548,220 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <main class="app">
-    <header class="head">
-      <div class="brand">
-        <span class="dot" :class="statusClass"></span>
-        <h1>DSH Panel</h1>
-        <span class="status">{{ statusText }}</span>
-      </div>
-      <button class="ghost" title="退出应用" @click="quit">退出</button>
-    </header>
-
-    <section class="card">
-      <div class="row">
-        <span class="label">本地 dsh</span>
-        <span class="value mono">{{ local?.dsh_version ?? "未检测到" }}</span>
-      </div>
-      <div class="row">
-        <span class="label">Node</span>
-        <span class="value mono">{{ local?.node_version ?? "—" }}</span>
-      </div>
-      <div class="row">
-        <span class="label">Web 端</span>
-        <span class="value" :class="{ off: harnessUp === false }">
-          {{ harnessUp === null ? "检测中…" : harnessText }}
-          <button
-            v-if="harnessUp"
-            class="tiny"
-            :disabled="!!busy"
-            title="在默认浏览器里打开 http://127.0.0.1:3080"
-            @click="openPage"
-          >
-            打开网页
-          </button>
-        </span>
-      </div>
-      <div class="row">
-        <span class="label">最新版本</span>
-        <span class="value mono" :class="{ hl: update?.has_update }">
-          {{ update?.latest_version ?? "—" }}
-        </span>
-      </div>
-      <div class="row">
-        <span class="label">上次检查</span>
-        <span class="value">{{ checkedText }}</span>
-      </div>
-      <div class="row">
-        <span class="label">余额</span>
-        <span class="value mono" :class="{ hl: balance?.ok, off: balance && !balance.ok }">
-          {{ balance?.ok ? `${balance.currency} ${balance.total}` : balance?.error ? "查询失败" : "—" }}
-        </span>
-      </div>
-      <p v-if="local?.error" class="hint err">{{ local.error }}</p>
-      <p v-else-if="update?.registry" class="hint">源：{{ update.registry }}</p>
-    </section>
-
-    <section class="actions">
-      <!-- 1. web harness: start when down, red stop when up -->
-      <button
-        class="primary"
-        :class="{ danger: harnessUp === true }"
-        :disabled="!!busy"
-        :title="
-          harnessUp === true
-            ? '停止占用 3080 端口的 harness（会中断正在使用它的会话）'
-            : '在面板内启动 dsh web --port 3080'
-        "
-        @click="toggleHarness"
-      >
-        <span v-if="webBusy" class="spinner"></span>
-        {{ busy === "stop" ? "停止中…" : harnessUp === true ? "停止 Web 端" : busy === "harness" ? "启动中…" : "启动 Web 端" }}
-      </button>
-
-      <!-- 2. desktop source path + browse -->
-      <div class="desktop-row">
-        <input
-          v-model="sourceDir"
-          class="path mono"
-          type="text"
-          spellcheck="false"
-          placeholder="桌面端源码根目录（可粘贴路径）"
-          title="DeepSeek Harness 源码根目录：可直接粘贴路径，或点右侧「浏览…」选择"
-          @change="saveSourceDir"
-        />
-        <button class="browse" :disabled="!!busy" title="选择源码根目录" @click="pickSourceDir">
-          浏览…
-        </button>
-      </div>
-
-      <!-- 3. desktop launch: start / red stop -->
-      <button
-        class="wide"
-        :class="{ danger: desktopUp }"
-        :disabled="!!busy"
-        :title="desktopUp ? '停止面板启动的桌面端' : '在源码目录执行 pnpm run dev:desktop'"
-        @click="toggleDesktop"
-      >
-        <span v-if="busy === 'desktop' || (desktopUp && busy === 'stop')" class="spinner"></span>
-        {{ desktopUp ? "停止桌面端" : busy === "desktop" ? "启动中…" : "启动桌面端" }}
-      </button>
-
-      <p class="hint desktop-hint">
-        桌面端（Electron）从源码启动：该目录需已 <code>pnpm install</code>，首次启动会构建，较慢。
-      </p>
-
-      <button :disabled="!!busy" @click="checkUpdate">
-        <span v-if="busy === 'check'" class="spinner"></span>
-        {{ busy === "check" ? "检查中…" : "检查更新" }}
-      </button>
-      <button
-        class="upgrade"
-        :class="{ attention: update?.has_update }"
-        :disabled="!!busy || !update?.has_update"
-        @click="upgrade"
-      >
-        <span v-if="busy === 'upgrade'" class="spinner"></span>
-        {{ busy === "upgrade" ? "升级中…" : "一键升级" }}
-      </button>
-    </section>
-
-    <p v-if="toast" class="toast" :class="toast.kind">{{ toast.text }}</p>
-
-    <details v-if="usage?.ok" class="usage">
-      <summary>
-        用量与消耗 · 近 24h / 7 天
-        <span class="term-actions">
-          <button class="tiny" :disabled="!!busy" @click.prevent="importUsage">导入历史</button>
-          <button class="tiny" :disabled="!!busy" @click.prevent="refreshUsage">刷新</button>
-        </span>
-      </summary>
-      <div class="usage-grid">
-        <div class="usage-cell">
-          <span class="label">近 24 小时</span>
-          <span class="value mono">{{ usage.day_tokens.toLocaleString() }} tok</span>
-          <span class="value mono hl">¥{{ usage.day_cost.toFixed(4) }}</span>
+  <div class="shell">
+    <!-- ============ dashboard ============ -->
+    <main class="dash">
+      <header class="dash-head">
+        <div class="brand">
+          <span class="dot" :class="statusClass"></span>
+          <h1>DSH Panel</h1>
+          <span class="status-pill">{{ statusText }}</span>
         </div>
-        <div class="usage-cell">
-          <span class="label">近 7 天</span>
-          <span class="value mono">{{ usage.week_tokens.toLocaleString() }} tok</span>
-          <span class="value mono hl">¥{{ usage.week_cost.toFixed(4) }}</span>
+        <button class="ghost" title="重新载入数据" @click="refreshSeries">刷新</button>
+      </header>
+
+      <section class="stats">
+        <div class="stat stat-primary">
+          <span class="stat-label">本月花费</span>
+          <span class="stat-value">
+            ¥{{ (series?.month_cost ?? 0).toFixed(2) }}
+          </span>
+          <span class="stat-sub">{{ series?.month_calls ?? 0 }} 次调用 · {{ ((series?.month_tokens ?? 0) / 1000).toFixed(0) }}K 令牌</span>
         </div>
-      </div>
-      <div v-for="m in usage.by_model.slice(0, 6)" :key="m.model" class="row usage-row">
-        <span class="label mono">{{ m.model }}</span>
-        <span class="value mono">{{ m.tokens.toLocaleString() }} tok · ¥{{ m.cost.toFixed(4) }}</span>
-      </div>
-      <p class="hint">累计 {{ usage.requests.toLocaleString() }} 次调用 · 总花费 ¥{{ usage.total_cost.toFixed(4) }}（数据来自 harness 的 dsh-usage-plugin）</p>
-    </details>
-
-    <details class="plugins">
-      <summary>
-        插件管理 · {{ currentProfile?.plugins.length ?? 0 }} 个第三方插件
-        <span class="term-actions">
-          <button class="tiny" :disabled="!!busy" @click.prevent="refreshPlugins">刷新</button>
-        </span>
-      </summary>
-
-      <div class="setting-row">
-        <select v-model="activeProfile" class="path mono" @change="refreshPlugins">
-          <option v-for="p in profiles" :key="p.profile" :value="p.profile">{{ p.profile }}</option>
-        </select>
-        <button class="tiny" :disabled="!!busy" @click.prevent="upgradePlugins">全部升级</button>
-      </div>
-
-      <div v-for="p in currentProfile?.plugins ?? []" :key="p.name" class="row plugin-row">
-        <span class="label mono plugin-name" :title="p.name">{{ p.name }}</span>
-        <span class="value mono">
-          {{ p.installed || "未安装" }}
-          <button class="tiny danger" :disabled="!!busy" @click.prevent="removePlugin(p.name)">卸载</button>
-        </span>
-      </div>
-      <p v-if="currentProfile && currentProfile.plugins.length === 0" class="hint">
-        这个 profile 没有第三方插件。
-      </p>
-
-      <div class="setting-row">
-        <input
-          v-model="newPlugin"
-          class="path mono"
-          type="text"
-          spellcheck="false"
-          placeholder="要安装的包名，如 @scope/dsh-xxx"
-          @keyup.enter="installPlugin"
-        />
-        <button class="tiny" :disabled="!!busy" @click.prevent="installPlugin">安装</button>
-      </div>
-      <p class="hint">
-        等价于在该 profile 目录执行 <code>dsh plugin --profile {{ activeProfile }} add &lt;包名&gt;</code>
-        （本质是 pnpm）。<b>装/卸后需要重启 Web 端才生效</b>，进度见下方终端。
-      </p>
-    </details>
-
-    <details class="plugins">
-      <summary>
-        飞书远程控制 · {{ bridgeRunning ? "运行中" : "已停止" }}
-        <span class="term-actions">
-          <button class="tiny" :disabled="!!busy" @click.prevent="refreshBridge">刷新</button>
-        </span>
-      </summary>
-
-      <div class="setting-row">
-        <input
-          v-model="bridgeUsers"
-          class="path mono"
-          type="text"
-          spellcheck="false"
-          placeholder="白名单 open_id（ou_ 开头，逗号分隔）"
-        />
-      </div>
-      <div class="setting-row">
-        <input
-          v-model="bridgeProfile"
-          class="path mono"
-          type="text"
-          spellcheck="false"
-          placeholder="dsh profile"
-          style="max-width: 110px"
-        />
-        <button
-          class="tiny"
-          :class="{ danger: bridgeRunning }"
-          :disabled="!!busy"
-          @click.prevent="bridgeRunning ? stopBridge() : startBridge()"
-        >
-          {{ bridgeRunning ? "停止桥" : "启动桥" }}
-        </button>
-      </div>
-      <p class="hint">
-        在飞书里给机器人发消息 → 本机执行
-        <code>dsh --profile {{ bridgeProfile || "headless" }}</code> → 结果回飞书。运行日志见下方终端。
-      </p>
-      <p class="hint">
-        ⚠️ 白名单必填：飞书消息等于本机执行权限。另外每条消息是<b>独立任务</b>（headless 无会话延续），
-        且需要先用 <code>lark-cli config init</code> 绑定飞书应用。
-      </p>
-    </details>
-
-    <details class="plugins">
-      <summary>
-        Hermes 网关 · {{ hermes?.ok ? hermes.gateway_state : "不可用" }}
-        <span class="term-actions">
-          <button class="tiny" :disabled="!!busy" @click.prevent="refreshHermes">刷新</button>
-          <button class="tiny" :disabled="!!busy" @click.prevent="openHermes">打开面板</button>
-        </span>
-      </summary>
-
-      <div v-if="hermes?.ok">
-        <div class="row">
-          <span class="label">版本 / PID</span>
-          <span class="value mono">{{ hermes.code_version }} · {{ hermes.pid }}</span>
-        </div>
-        <div class="row">
-          <span class="label">活跃 Agent</span>
-          <span class="value mono">{{ hermes.active_agents }}</span>
-        </div>
-        <div v-for="p in hermes.platforms" :key="p.name" class="row">
-          <span class="label">{{ p.name }}</span>
-          <span
-            class="value"
-            :class="{ off: p.state !== 'connected', hl: p.state === 'connected' }"
-          >
-            {{ p.state }}{{ p.needs_attention ? " · 需要注意" : "" }}
+        <div class="stat">
+          <span class="stat-label">剩余余额</span>
+          <span class="stat-value">{{ balanceText }}</span>
+          <span class="stat-sub">
+            <template v-if="balance?.ok">
+              充值 {{ balance.topped_up }} · 赠送 {{ balance.granted }}
+            </template>
+            <template v-else>{{ balance?.error ?? "—" }}</template>
           </span>
         </div>
+        <div class="stat">
+          <span class="stat-label">Web 端</span>
+          <span class="stat-value" :class="{ 'is-off': harnessUp === false }">{{ harnessText }}</span>
+          <span class="stat-sub">
+            <button v-if="harnessUp" class="link" @click="openPage">打开网页 →</button>
+            <template v-else>端口 {{ HARNESS_PORT }}</template>
+          </span>
+        </div>
+      </section>
+
+      <section class="panel chart-panel">
+        <div class="panel-head">
+          <div>
+            <h2>消耗趋势</h2>
+            <p class="panel-sub">{{ rangeText }}</p>
+          </div>
+          <div class="segmented">
+            <button :class="{ active: bucket === 'day' }" @click="setBucket('day')">近 7 天</button>
+            <button :class="{ active: bucket === 'week' }" @click="setBucket('week')">近 8 周</button>
+            <button :class="{ active: bucket === 'month' }" @click="setBucket('month')">近 12 月</button>
+          </div>
+        </div>
+
+        <UsageChart v-if="series?.ok && series.points.length" :points="series.points" :bucket="bucket" />
+        <p v-else class="empty">
+          {{ series?.error ?? "还没有用量数据。装插件时点左侧设置里的「导入历史」，或让 harness 跑一段时间。" }}
+        </p>
+
+        <p v-if="series?.ok && series.filled < series.points.length" class="gap-note">
+          这 {{ series.points.length }} 个区间里有 {{ series.filled }} 个有用量记录，其余为**空档**（不是零消耗）——空心圆点表示该区间没有数据。
+        </p>
+      </section>
+    </main>
+
+    <!-- ============ floating buttons ============ -->
+    <button
+      class="fab fab-left"
+      :class="{ open: drawerOpen }"
+      title="设置"
+      @click="drawerOpen = !drawerOpen"
+    >
+      <span class="fab-icon">⚙</span>
+    </button>
+
+    <button
+      class="fab fab-right"
+      :class="{ stop: harnessUp === true }"
+      :disabled="!!busy"
+      :title="harnessUp ? '停止 Web 端' : '启动 Web 端'"
+      @click="toggleHarness"
+    >
+      <span v-if="busy === 'harness' || busy === 'stop'" class="spinner"></span>
+      <span v-else-if="harnessUp" class="icon-stop" aria-hidden="true"></span>
+      <span v-else class="icon-play" aria-hidden="true"></span>
+    </button>
+
+    <!-- ============ settings drawer ============ -->
+    <div v-if="drawerOpen" class="scrim" @click="drawerOpen = false"></div>
+    <aside class="drawer" :class="{ open: drawerOpen }">
+      <header class="drawer-head">
+        <h2>设置</h2>
+        <button class="ghost" @click="drawerOpen = false">关闭</button>
+      </header>
+
+      <div class="drawer-body">
+        <!-- runtime -->
+        <section class="panel">
+          <h3>运行环境</h3>
+          <div class="row"><span class="label">本地 dsh</span><span class="value mono">{{ local?.dsh_version ?? "未检测到" }}</span></div>
+          <div class="row"><span class="label">Node</span><span class="value mono">{{ local?.node_version ?? "—" }}</span></div>
+          <div class="row"><span class="label">最新版本</span><span class="value mono" :class="{ hl: update?.has_update }">{{ update?.latest_version ?? "—" }}</span></div>
+          <div class="row"><span class="label">上次检查</span><span class="value">{{ checkedText }}</span></div>
+          <p v-if="local?.error" class="hint err">{{ local.error }}</p>
+          <div class="btn-row">
+            <button :disabled="!!busy" @click="checkUpdate">
+              <span v-if="busy === 'check'" class="spinner"></span>检查更新
+            </button>
+            <button class="accent" :class="{ attention: update?.has_update }" :disabled="!!busy || !update?.has_update" @click="upgrade">
+              <span v-if="busy === 'upgrade'" class="spinner"></span>一键升级
+            </button>
+          </div>
+        </section>
+
+        <!-- desktop app -->
+        <section class="panel">
+          <h3>桌面端（Electron）</h3>
+          <p class="hint">桌面端不随 npm 包分发，需一份源码；该目录要已 <code>pnpm install</code>，首次启动会构建。</p>
+          <div class="field">
+            <input v-model="sourceDir" class="input mono" type="text" spellcheck="false" placeholder="源码根目录" @change="saveSourceDir" />
+            <button class="btn-sm" @click="pickSourceDir">浏览…</button>
+          </div>
+          <div class="btn-row">
+            <button class="danger-outline" :disabled="!!busy" @click="desktopUp ? stopDesktop() : startDesktop()">
+              {{ desktopUp ? "停止桌面端" : "启动桌面端" }}
+            </button>
+          </div>
+        </section>
+
+        <!-- plugins -->
+        <section class="panel">
+          <h3>插件管理</h3>
+          <div class="field">
+            <select v-model="activeProfile" class="input mono" @change="refreshPlugins">
+              <option v-for="p in profiles" :key="p.profile" :value="p.profile">{{ p.profile }}</option>
+            </select>
+            <button class="btn-sm" :disabled="!!busy" @click="upgradePlugins">全部升级</button>
+          </div>
+          <div v-for="p in currentProfile?.plugins ?? []" :key="p.name" class="row">
+            <span class="label mono ellipsis" :title="p.name">{{ p.name }}</span>
+            <span class="value mono">
+              {{ p.installed || "未安装" }}
+              <button class="btn-sm danger-outline" :disabled="!!busy" @click="removePlugin(p.name)">卸载</button>
+            </span>
+          </div>
+          <p v-if="currentProfile && currentProfile.plugins.length === 0" class="hint">该 profile 没有第三方插件。</p>
+          <div class="field">
+            <input v-model="newPlugin" class="input mono" type="text" spellcheck="false" placeholder="要安装的包名" @keyup.enter="installPlugin" />
+            <button class="btn-sm" :disabled="!!busy" @click="installPlugin">安装</button>
+          </div>
+          <p class="hint">
+            装/卸后需重启 Web 端才生效。面板的用量统计不再依赖插件（内核自带 token 计量），
+            可以安全卸载。
+          </p>
+          <div class="btn-row">
+            <button :disabled="!!busy" @click="importUsage">
+              <span v-if="busy === 'import'" class="spinner"></span>导入插件历史用量
+            </button>
+          </div>
+        </section>
+
+        <!-- feishu -->
+        <section class="panel">
+          <h3>飞书远程控制</h3>
+          <p class="hint">
+            在飞书里给机器人发消息 → 本机执行 <code>dsh --profile headless</code> → 结果回飞书。
+            需要先建好飞书应用并 <code>lark-cli config init</code>。
+          </p>
+          <div class="field">
+            <input v-model="bridgeUsers" class="input mono" type="text" spellcheck="false" placeholder="白名单 open_id（ou_ 开头，逗号分隔）" />
+          </div>
+          <div class="btn-row">
+            <button :class="{ 'danger-outline': bridgeRunning }" :disabled="!!busy" @click="bridgeRunning ? stopBridge() : startBridge()">
+              {{ bridgeRunning ? "停止桥" : "启动桥" }}
+            </button>
+            <span class="muted">{{ bridgeRunning ? "运行中" : "已停止" }}</span>
+          </div>
+        </section>
+
+        <!-- hermes -->
+        <section class="panel">
+          <h3>Hermes 网关</h3>
+          <div v-if="hermes?.ok">
+            <div class="row"><span class="label">状态</span><span class="value" :class="{ hl: hermes.gateway_state === 'running' }">{{ hermes.gateway_state }}</span></div>
+            <div class="row"><span class="label">版本 / PID</span><span class="value mono">{{ hermes.code_version }} · {{ hermes.pid }}</span></div>
+            <div class="row"><span class="label">活跃 Agent</span><span class="value mono">{{ hermes.active_agents }}</span></div>
+            <div v-for="p in hermes.platforms" :key="p.name" class="row">
+              <span class="label">{{ p.name }}</span>
+              <span class="value" :class="{ hl: p.state === 'connected', 'is-off': p.state !== 'connected' }">
+                {{ p.state }}{{ p.needs_attention ? " · 需注意" : "" }}
+              </span>
+            </div>
+          </div>
+          <p v-else class="hint err">{{ hermes?.error ?? "读不到 Hermes 状态" }}</p>
+          <div class="btn-row">
+            <button @click="refreshHermes">刷新</button>
+            <button @click="openHermes">打开面板</button>
+          </div>
+          <p class="hint">只读状态。启停请用 <code>docker compose --profile ai</code>。</p>
+        </section>
+
+        <!-- terminal -->
+        <section class="panel">
+          <h3>终端输出</h3>
+          <pre ref="termEl" class="term">{{ termLines.length ? termLines.join("\n") : "（暂无输出）" }}</pre>
+        </section>
+
+        <section class="panel">
+          <div class="btn-row">
+            <button class="danger-outline" @click="quit">退出 DSH Panel</button>
+          </div>
+        </section>
       </div>
-      <p v-else class="hint err">{{ hermes?.error ?? "读不到 Hermes 状态" }}</p>
+    </aside>
 
-      <p class="hint">
-        Hermes 是跑在 Docker 里的另一个 AI Agent（自带多平台网关，包括飞书）。这里**只读**它的状态，
-        不做启停 —— 要改配置请用 <code>docker compose --profile ai</code>。
-      </p>
-    </details>
-
-    <details v-if="termLines.length" class="term">
-      <summary>
-        <span>终端 · {{ termLines.length }} 行</span>
-        <span class="term-actions">
-          <button class="tiny" :disabled="!!busy" @click.prevent="stopHarnessWeb">停 Web</button>
-          <button class="tiny" :disabled="!!busy" @click.prevent="stopDesktop">停桌面</button>
-        </span>
-      </summary>
-      <pre ref="termEl">{{ termLines.join("\n") }}</pre>
-    </details>
-
-    <details v-if="logText" class="log">
-      <summary>npm 输出</summary>
-      <pre>{{ logText }}</pre>
-    </details>
-  </main>
+    <p v-if="toast" class="toast" :class="toast.kind">{{ toast.text }}</p>
+  </div>
 </template>
