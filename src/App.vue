@@ -276,6 +276,23 @@ async function upgradePlugins() {
   }
 }
 
+/** One-shot: pull the plugin's full record list into our own per-day store.
+ *  Must run while the plugin is still installed - it is the only source of
+ *  history that already carries cost figures. */
+async function importUsage() {
+  busy.value = "import";
+  say("info", "正在从插件导入历史用量…");
+  try {
+    const r = await invoke<ActionResult>("import_plugin_usage");
+    say(r.ok ? "ok" : "err", r.message);
+    await refreshUsage();
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
+  }
+}
+
 async function loadSettings() {
   try {
     const s = await invoke<Settings>("get_settings");
@@ -507,6 +524,17 @@ onMounted(async () => {
   // (a balance query hits the provider API, so don't hammer it).
   await refreshBalance();
   await refreshUsage();
+  // First run (or after the plugins get uninstalled): seed our own store from
+  // the plugin once, while it is still there. Silently skipped when unavailable.
+  try {
+    const probe = await invoke<{ filled: number }>("usage_series", { bucket: "day", count: 7 });
+    if (probe.filled === 0) {
+      const r = await invoke<ActionResult>("import_plugin_usage");
+      if (r.ok) say("ok", r.message);
+    }
+  } catch {
+    // no harness / no plugin - the chart simply stays empty
+  }
   await refreshPlugins();
   await refreshBridge();
   await refreshHermes();
@@ -651,6 +679,7 @@ onUnmounted(() => {
       <summary>
         用量与消耗 · 近 24h / 7 天
         <span class="term-actions">
+          <button class="tiny" :disabled="!!busy" @click.prevent="importUsage">导入历史</button>
           <button class="tiny" :disabled="!!busy" @click.prevent="refreshUsage">刷新</button>
         </span>
       </summary>

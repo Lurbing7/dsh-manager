@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -6,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::Datelike;
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -1656,6 +1658,408 @@ fn open_hermes_page() -> ActionResult {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Usage store
+//
+// Token accounting is the harness kernel's own feature (packages/llm/token-meter):
+// it derives exact per-turn usage from session events. Plugins that show charts
+// merely parse those sessions and cache the result. Since this panel must keep
+// working after plugins are uninstalled, it keeps its own store here:
+//   %APPDATA%\<identifier>\usage\YYYY-MM-DD.json   (one aggregated file per day)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct ModelDay {
+    calls: u64,
+    tokens: u64,
+    cost: f64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct DayUsage {
+    date: String,
+    calls: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    cost: f64,
+    by_model: HashMap<String, ModelDay>,
+}
+
+impl DayUsage {
+    /// Billed total for the day: prompt + completion. Cache *reads* are not
+    /// added here because they are already billed at a different rate and would
+    /// double-count the prompt (the plugin reports them as a separate bucket).
+    fn tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.cache_write_tokens
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add(
+        &mut self,
+        model: &str,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        reasoning: u64,
+        cost: f64,
+    ) {
+        self.calls += 1;
+        self.input_tokens += input;
+        self.output_tokens += output;
+        self.cache_read_tokens += cache_read;
+        self.cache_write_tokens += cache_write;
+        self.reasoning_tokens += reasoning;
+        self.cost += cost;
+        let entry = self.by_model.entry(model.to_string()).or_default();
+        entry.calls += 1;
+        entry.tokens += input + output + cache_write;
+        entry.cost += cost;
+    }
+}
+
+fn usage_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("取不到应用数据目录: {e}"))?
+        .join("usage");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建用量目录失败: {e}"))?;
+    Ok(dir)
+}
+
+/// Local (not UTC) calendar date for a millisecond timestamp.
+fn local_date(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_else(|| "1970-01-01".to_string())
+}
+
+fn load_day(path: &PathBuf, date: &str) -> DayUsage {
+    let mut day = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<DayUsage>(&t).ok())
+        .unwrap_or_default();
+    day.date = date.to_string();
+    day
+}
+
+fn save_day(dir: &PathBuf, day: &DayUsage) -> Result<(), String> {
+    let path = dir.join(format!("{}.json", day.date));
+    let text = serde_json::to_string(day).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| e.to_string())
+}
+
+/// Every day file we hold, sorted by date ascending.
+fn load_all_days(app: &AppHandle) -> Result<Vec<DayUsage>, String> {
+    let dir = usage_dir(app)?;
+    let mut days = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Only YYYY-MM-DD.json counts.
+        if stem.len() != 10 {
+            continue;
+        }
+        days.push(load_day(&path, stem));
+    }
+    days.sort_by(|a, b| a.date.cmp(&b.date));
+    Ok(days)
+}
+
+/// One point on a chart.
+#[derive(Serialize, Clone)]
+struct UsagePoint {
+    /// Axis label: "09-18" (day) · "09-08周" (week) · "2026-09" (month)
+    label: String,
+    /// ISO week / month key, so the UI can show a tooltip title.
+    key: String,
+    cost: f64,
+    tokens: u64,
+    calls: u64,
+}
+
+#[derive(Serialize, Clone)]
+struct UsageSeries {
+    ok: bool,
+    bucket: String,
+    points: Vec<UsagePoint>,
+    total_cost: f64,
+    total_tokens: u64,
+    total_calls: u64,
+    /// Current local calendar month, independent of the selected bucket.
+    month_cost: f64,
+    month_tokens: u64,
+    month_calls: u64,
+    /// How many of the requested buckets actually had data (the rest are gaps).
+    filled: u32,
+    error: Option<String>,
+}
+
+/// Import the full record list from the plugin while it is still installed.
+/// This is the only chance to capture history in a format that survives
+/// uninstalling the plugin.
+#[tauri::command]
+async fn import_plugin_usage(app: AppHandle) -> ActionResult {
+    let value = match usage_api(serde_json::json!({ "action": "list" })).await {
+        Ok(v) => v,
+        Err(e) => {
+            return ActionResult {
+                ok: false,
+                action: "import".into(),
+                message: format!("读取插件数据失败：{e}"),
+                output: String::new(),
+            }
+        }
+    };
+    let Some(records) = value["records"].as_array() else {
+        return ActionResult {
+            ok: false,
+            action: "import".into(),
+            message: "插件返回的数据里没有 records 数组".into(),
+            output: String::new(),
+        };
+    };
+
+    let dir = match usage_dir(&app) {
+        Ok(d) => d,
+        Err(e) => {
+            return ActionResult {
+                ok: false,
+                action: "import".into(),
+                message: e,
+                output: String::new(),
+            }
+        }
+    };
+
+    let mut days: HashMap<String, DayUsage> = HashMap::new();
+    let mut skipped = 0usize;
+    for r in records {
+        let ts = r["time"].as_i64().unwrap_or(0);
+        if ts <= 0 {
+            skipped += 1;
+            continue;
+        }
+        let date = local_date(ts);
+        let day = days.entry(date.clone()).or_insert_with(|| DayUsage {
+            date,
+            ..Default::default()
+        });
+        day.add(
+            r["model"].as_str().unwrap_or("unknown"),
+            r["inputTokens"].as_u64().unwrap_or(0),
+            r["outputTokens"].as_u64().unwrap_or(0),
+            r["cacheReadTokens"].as_u64().unwrap_or(0),
+            r["cacheWriteTokens"].as_u64().unwrap_or(0),
+            r["reasoningTokens"].as_u64().unwrap_or(0),
+            r["autoCost"].as_f64().unwrap_or(0.0),
+        );
+    }
+
+    let total_days = days.len();
+    let mut written = 0usize;
+    let mut cost = 0.0f64;
+    for day in days.values() {
+        if save_day(&dir, day).is_ok() {
+            written += 1;
+            cost += day.cost;
+        }
+    }
+
+    ActionResult {
+        ok: written > 0,
+        action: "import".into(),
+        message: format!(
+            "已导入 {} 条记录，覆盖 {written}/{total_days} 天，合计 ¥{cost:.2}{}",
+            records.len() - skipped,
+            if skipped > 0 {
+                format!("（{skipped} 条缺时间戳已跳过）")
+            } else {
+                String::new()
+            }
+        ),
+        output: String::new(),
+    }
+}
+
+/// Aggregate the store into day / week / month buckets.
+#[tauri::command]
+fn usage_series(app: AppHandle, bucket: Option<String>, count: Option<u32>) -> UsageSeries {
+    let bucket = bucket.unwrap_or_else(|| "day".into());
+    let default_count = match bucket.as_str() {
+        "week" => 8,
+        "month" => 12,
+        _ => 7,
+    };
+    let count = count.unwrap_or(default_count).clamp(1, 60);
+
+    let fail = |err: String| UsageSeries {
+        ok: false,
+        bucket: bucket.clone(),
+        points: Vec::new(),
+        total_cost: 0.0,
+        total_tokens: 0,
+        total_calls: 0,
+        month_cost: 0.0,
+        month_tokens: 0,
+        month_calls: 0,
+        filled: 0,
+        error: Some(err),
+    };
+
+    let days = match load_all_days(&app) {
+        Ok(d) => d,
+        Err(e) => return fail(e),
+    };
+
+    let today = chrono::Local::now().date_naive();
+    let month_prefix = today.format("%Y-%m").to_string();
+
+    // Current calendar month totals, always computed regardless of bucket.
+    let mut month_cost = 0.0;
+    let mut month_tokens = 0u64;
+    let mut month_calls = 0u64;
+    for d in &days {
+        if d.date.starts_with(&month_prefix) {
+            month_cost += d.cost;
+            month_tokens += d.tokens();
+            month_calls += d.calls;
+        }
+    }
+
+    // Bucket key + label for one day, plus the ordered list of buckets we want.
+    let key_of = |date: &chrono::NaiveDate| -> String {
+        match bucket.as_str() {
+            "week" => date.format("%G-W%V").to_string(),
+            "month" => date.format("%Y-%m").to_string(),
+            _ => date.format("%Y-%m-%d").to_string(),
+        }
+    };
+
+    let mut wanted: Vec<String> = Vec::new();
+    match bucket.as_str() {
+        "week" => {
+            // Count back whole weeks from the current ISO week.
+            let mut cursor = today;
+            for _ in 0..count {
+                wanted.push(key_of(&cursor));
+                cursor -= chrono::Duration::days(7);
+            }
+        }
+        "month" => {
+            let mut year = today.year();
+            let mut month = today.month();
+            for _ in 0..count {
+                wanted.push(format!("{year:04}-{month:02}"));
+                if month == 1 {
+                    month = 12;
+                    year -= 1;
+                } else {
+                    month -= 1;
+                }
+            }
+        }
+        _ => {
+            let mut cursor = today;
+            for _ in 0..count {
+                wanted.push(cursor.format("%Y-%m-%d").to_string());
+                cursor -= chrono::Duration::days(1);
+            }
+        }
+    }
+    wanted.reverse(); // oldest -> newest
+
+    // Fold the store into those buckets.
+    let mut acc: HashMap<String, (f64, u64, u64)> = HashMap::new();
+    let horizon = wanted.first().cloned().unwrap_or_default();
+    for d in &days {
+        let key = d.date.clone();
+        // Only keep days that can land in a wanted bucket.
+        let in_range = match bucket.as_str() {
+            "month" => key.as_str() >= horizon.as_str(),
+            _ => true,
+        };
+        if !in_range {
+            continue;
+        }
+        let bucket_key = match bucket.as_str() {
+            "week" | "month" => match chrono::NaiveDate::parse_from_str(&key, "%Y-%m-%d") {
+                Ok(date) => key_of(&date),
+                Err(_) => continue,
+            },
+            _ => key,
+        };
+        if !wanted.contains(&bucket_key) {
+            continue;
+        }
+        let slot = acc.entry(bucket_key).or_insert((0.0, 0, 0));
+        slot.0 += d.cost;
+        slot.1 += d.tokens();
+        slot.2 += d.calls;
+    }
+
+    let mut points = Vec::new();
+    let mut filled = 0u32;
+    for key in &wanted {
+        let (cost, tokens, calls) = acc.get(key).copied().unwrap_or((0.0, 0, 0));
+        if calls > 0 {
+            filled += 1;
+        }
+        let label = match bucket.as_str() {
+            "week" => key
+                .split("-W")
+                .nth(1)
+                .map(|w| format!("第{w}周"))
+                .unwrap_or_else(|| key.clone()),
+            "month" => key
+                .split('-')
+                .nth(1)
+                .map(|m| format!("{m}月"))
+                .unwrap_or_else(|| key.clone()),
+            _ => key.get(5..).unwrap_or(key).to_string(),
+        };
+        points.push(UsagePoint {
+            label,
+            key: key.clone(),
+            cost,
+            tokens,
+            calls,
+        });
+    }
+
+    let total_cost = points.iter().map(|p| p.cost).sum();
+    let total_tokens = points.iter().map(|p| p.tokens).sum();
+    let total_calls = points.iter().map(|p| p.calls).sum();
+
+    UsageSeries {
+        ok: true,
+        bucket,
+        points,
+        total_cost,
+        total_tokens,
+        total_calls,
+        month_cost,
+        month_tokens,
+        month_calls,
+        filled,
+        error: None,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     detach_from_job_if_needed();
@@ -1756,6 +2160,8 @@ pub fn run() {
             desktop_running,
             get_balance,
             get_usage_summary,
+            import_plugin_usage,
+            usage_series,
             list_plugins,
             install_plugin,
             remove_plugin,
