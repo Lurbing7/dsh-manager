@@ -1013,6 +1013,181 @@ fn detach_from_job_if_needed() {
 #[cfg(not(windows))]
 fn detach_from_job_if_needed() {}
 
+// ---------------------------------------------------------------------------
+// Usage / balance (delegated to the dsh-usage-plugin running inside the harness)
+// ---------------------------------------------------------------------------
+
+/// The usage plugin registers this route on the harness web server. It is
+/// intentionally reachable without a session cookie so an external client (the
+/// desktop shell, or this panel) can read usage and balance.
+const USAGE_API_PATH: &str = "/usage/api";
+
+async fn usage_api(body: serde_json::Value) -> Result<serde_json::Value, String> {
+    let url = format!(
+        "http://127.0.0.1:{}{}",
+        DEFAULT_HARNESS_PORT, USAGE_API_PATH
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("连不上 harness（{url}）：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("插件接口返回 HTTP {}", resp.status()));
+    }
+    resp.json()
+        .await
+        .map_err(|e| format!("解析插件响应失败: {e}"))
+}
+
+#[derive(Serialize, Clone)]
+struct BalanceInfo {
+    ok: bool,
+    provider: String,
+    currency: String,
+    total: String,
+    topped_up: String,
+    granted: String,
+    queried_at: u64,
+    error: Option<String>,
+}
+
+/// Ask the plugin for the provider balance (DeepSeek by default).
+#[tauri::command]
+async fn get_balance(provider: Option<String>) -> BalanceInfo {
+    let provider = provider.unwrap_or_else(|| "deepseek".into());
+    let blank = |err: String| BalanceInfo {
+        ok: false,
+        provider: provider.clone(),
+        currency: String::new(),
+        total: String::new(),
+        topped_up: String::new(),
+        granted: String::new(),
+        queried_at: 0,
+        error: Some(err),
+    };
+
+    match usage_api(serde_json::json!({ "action": "balance", "provider": provider })).await {
+        Ok(v) => BalanceInfo {
+            ok: v["ok"].as_bool().unwrap_or(false),
+            provider,
+            currency: v["currency"].as_str().unwrap_or("").to_string(),
+            total: v["totalBalance"].as_str().unwrap_or("").to_string(),
+            topped_up: v["infos"][0]["toppedUpBalance"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+            granted: v["infos"][0]["grantedBalance"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+            queried_at: v["queriedAt"].as_u64().unwrap_or(0),
+            error: v["error"].as_str().map(|s| s.to_string()),
+        },
+        Err(e) => blank(e),
+    }
+}
+
+#[derive(Serialize, Clone, Default)]
+struct ModelUsage {
+    model: String,
+    tokens: u64,
+    cost: f64,
+}
+
+#[derive(Serialize, Clone)]
+struct UsageSummary {
+    ok: bool,
+    /// Rolling window totals (not calendar days - avoids timezone guesswork).
+    day_tokens: u64,
+    day_cost: f64,
+    week_tokens: u64,
+    week_cost: f64,
+    total_cost: f64,
+    requests: usize,
+    by_model: Vec<ModelUsage>,
+    error: Option<String>,
+}
+
+/// Pull the plugin's full record list and aggregate it here: the raw response is
+/// ~1.9 MB, far too much to hand to the webview on every refresh.
+#[tauri::command]
+async fn get_usage_summary(days: Option<u32>) -> UsageSummary {
+    let days = days.unwrap_or(7).max(1) as u64;
+    let fail = |err: String| UsageSummary {
+        ok: false,
+        day_tokens: 0,
+        day_cost: 0.0,
+        week_tokens: 0,
+        week_cost: 0.0,
+        total_cost: 0.0,
+        requests: 0,
+        by_model: Vec::new(),
+        error: Some(err),
+    };
+
+    let value = match usage_api(serde_json::json!({ "action": "list" })).await {
+        Ok(v) => v,
+        Err(e) => return fail(e),
+    };
+    let Some(records) = value["records"].as_array() else {
+        return fail("插件返回的数据里没有 records 数组".into());
+    };
+
+    let now_ms = now_secs() * 1000;
+    let day_start = now_ms.saturating_sub(24 * 60 * 60 * 1000);
+    let week_start = now_ms.saturating_sub(days * 24 * 60 * 60 * 1000);
+
+    let mut out = UsageSummary {
+        ok: true,
+        day_tokens: 0,
+        day_cost: 0.0,
+        week_tokens: 0,
+        week_cost: 0.0,
+        total_cost: 0.0,
+        requests: records.len(),
+        by_model: Vec::new(),
+        error: None,
+    };
+    let mut models: std::collections::HashMap<String, (u64, f64)> =
+        std::collections::HashMap::new();
+
+    for r in records {
+        let t = r["time"].as_u64().unwrap_or(0);
+        let tokens = r["inputTokens"].as_u64().unwrap_or(0)
+            + r["outputTokens"].as_u64().unwrap_or(0)
+            + r["cacheWriteTokens"].as_u64().unwrap_or(0);
+        let cost = r["autoCost"].as_f64().unwrap_or(0.0);
+
+        out.total_cost += cost;
+        if t >= week_start {
+            out.week_tokens += tokens;
+            out.week_cost += cost;
+            let name = r["model"].as_str().unwrap_or("unknown").to_string();
+            let entry = models.entry(name).or_insert((0, 0.0));
+            entry.0 += tokens;
+            entry.1 += cost;
+        }
+        if t >= day_start {
+            out.day_tokens += tokens;
+            out.day_cost += cost;
+        }
+    }
+
+    let mut by_model: Vec<ModelUsage> = models
+        .into_iter()
+        .map(|(model, (tokens, cost))| ModelUsage { model, tokens, cost })
+        .collect();
+    by_model.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
+    out.by_model = by_model;
+    out
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     detach_from_job_if_needed();
@@ -1111,6 +1286,8 @@ pub fn run() {
             start_desktop_app,
             stop_desktop_app,
             desktop_running,
+            get_balance,
+            get_usage_summary,
             harness_running,
             quit_app
         ])

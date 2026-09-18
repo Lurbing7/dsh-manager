@@ -33,6 +33,35 @@ interface Settings {
   desktop_source_dir: string | null;
 }
 
+interface BalanceInfo {
+  ok: boolean;
+  provider: string;
+  currency: string;
+  total: string;
+  topped_up: string;
+  granted: string;
+  queried_at: number;
+  error: string | null;
+}
+
+interface ModelUsage {
+  model: string;
+  tokens: number;
+  cost: number;
+}
+
+interface UsageSummary {
+  ok: boolean;
+  day_tokens: number;
+  day_cost: number;
+  week_tokens: number;
+  week_cost: number;
+  total_cost: number;
+  requests: number;
+  by_model: ModelUsage[];
+  error: string | null;
+}
+
 /** Where this machine serves the harness web UI. */
 const HARNESS_PORT = 3080;
 
@@ -50,6 +79,10 @@ const desktopUp = ref(false);
 /** Live console output from whatever the panel launched. */
 const termLines = ref<string[]>([]);
 const termEl = ref<HTMLElement | null>(null);
+/** Usage-plugin data (balance + token/cost summary). */
+const balance = ref<BalanceInfo | null>(null);
+const usage = ref<UsageSummary | null>(null);
+let usageTimer: number | null = null;
 
 let unlisten: UnlistenFn | null = null;
 let unlistenHarness: UnlistenFn | null = null;
@@ -74,6 +107,24 @@ async function refreshLocal() {
     local.value = await invoke<LocalInfo>("get_local_info");
   } catch (e) {
     say("err", String(e));
+  }
+}
+
+/** Balance from the usage plugin (it queries the provider, e.g. DeepSeek). */
+async function refreshBalance() {
+  try {
+    balance.value = await invoke<BalanceInfo>("get_balance", { provider: "deepseek" });
+  } catch (e) {
+    balance.value = { ok: false, provider: "deepseek", currency: "", total: "", topped_up: "", granted: "", queried_at: 0, error: String(e) };
+  }
+}
+
+/** Token/cost summary, aggregated in Rust (the raw record list is ~1.9 MB). */
+async function refreshUsage() {
+  try {
+    usage.value = await invoke<UsageSummary>("get_usage_summary", { days: 7 });
+  } catch (e) {
+    usage.value = { ok: false, day_tokens: 0, day_cost: 0, week_tokens: 0, week_cost: 0, total_cost: 0, requests: 0, by_model: [], error: String(e) };
   }
 }
 
@@ -275,12 +326,23 @@ onMounted(async () => {
     // the poller will fill this in on its next tick
   }
   await checkUpdate();
+  // Usage/balance come from the harness plugin; refresh on open and every 60s
+  // (a balance query hits the provider API, so don't hammer it).
+  await refreshBalance();
+  await refreshUsage();
+  usageTimer = window.setInterval(() => {
+    if (harnessUp.value) {
+      void refreshBalance();
+      void refreshUsage();
+    }
+  }, 60000);
 });
 
 onUnmounted(() => {
   unlisten?.();
   unlistenHarness?.();
   unlistenTerm?.();
+  if (usageTimer !== null) window.clearInterval(usageTimer);
 });
 </script>
 
@@ -319,6 +381,12 @@ onUnmounted(() => {
       <div class="row">
         <span class="label">上次检查</span>
         <span class="value">{{ checkedText }}</span>
+      </div>
+      <div class="row">
+        <span class="label">余额</span>
+        <span class="value mono" :class="{ hl: balance?.ok, off: balance && !balance.ok }">
+          {{ balance?.ok ? `${balance.currency} ${balance.total}` : balance?.error ? "查询失败" : "—" }}
+        </span>
       </div>
       <p v-if="local?.error" class="hint err">{{ local.error }}</p>
       <p v-else-if="update?.registry" class="hint">源：{{ update.registry }}</p>
@@ -389,6 +457,32 @@ onUnmounted(() => {
     </section>
 
     <p v-if="toast" class="toast" :class="toast.kind">{{ toast.text }}</p>
+
+    <details v-if="usage?.ok" class="usage">
+      <summary>
+        用量与消耗 · 近 24h / 7 天
+        <span class="term-actions">
+          <button class="tiny" :disabled="!!busy" @click.prevent="refreshUsage">刷新</button>
+        </span>
+      </summary>
+      <div class="usage-grid">
+        <div class="usage-cell">
+          <span class="label">近 24 小时</span>
+          <span class="value mono">{{ usage.day_tokens.toLocaleString() }} tok</span>
+          <span class="value mono hl">¥{{ usage.day_cost.toFixed(4) }}</span>
+        </div>
+        <div class="usage-cell">
+          <span class="label">近 7 天</span>
+          <span class="value mono">{{ usage.week_tokens.toLocaleString() }} tok</span>
+          <span class="value mono hl">¥{{ usage.week_cost.toFixed(4) }}</span>
+        </div>
+      </div>
+      <div v-for="m in usage.by_model.slice(0, 6)" :key="m.model" class="row usage-row">
+        <span class="label mono">{{ m.model }}</span>
+        <span class="value mono">{{ m.tokens.toLocaleString() }} tok · ¥{{ m.cost.toFixed(4) }}</span>
+      </div>
+      <p class="hint">累计 {{ usage.requests.toLocaleString() }} 次调用 · 总花费 ¥{{ usage.total_cost.toFixed(4) }}（数据来自 harness 的 dsh-usage-plugin）</p>
+    </details>
 
     <details v-if="termLines.length" class="term">
       <summary>
