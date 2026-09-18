@@ -1373,6 +1373,161 @@ fn plugin_op_running() -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Feishu → dsh bridge
+// ---------------------------------------------------------------------------
+
+/// The bridge script, embedded so the installed exe does not need the repo.
+const BRIDGE_JS: &str = include_str!("../../scripts/feishu-bridge.mjs");
+
+static BRIDGE_CHILD: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
+
+#[derive(Serialize, Clone)]
+struct BridgeStatus {
+    running: bool,
+    /// Absolute path of the extracted helper script.
+    script: String,
+}
+
+/// Write the embedded bridge next to our app data and return its path.
+fn bridge_script_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("取不到应用数据目录: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建应用数据目录失败: {e}"))?;
+    let path = dir.join("feishu-bridge.mjs");
+    // Always refresh: the script is versioned with the exe.
+    std::fs::write(&path, BRIDGE_JS).map_err(|e| format!("写入桥脚本失败: {e}"))?;
+    Ok(path)
+}
+
+fn bridge_running_inner() -> bool {
+    match BRIDGE_CHILD
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .as_mut()
+    {
+        Some(child) => matches!(child.try_wait(), Ok(None)),
+        None => false,
+    }
+}
+
+#[tauri::command]
+fn feishu_bridge_status(app: AppHandle) -> BridgeStatus {
+    let script = bridge_script_path(&app)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    BridgeStatus {
+        running: bridge_running_inner(),
+        script,
+    }
+}
+
+/// Start the bridge. `allowed_users` is required: without it the bridge refuses
+/// every message, because a Feishu bot message is effectively shell access here.
+#[tauri::command]
+fn feishu_bridge_start(
+    app: AppHandle,
+    allowed_users: String,
+    profile: Option<String>,
+) -> ActionResult {
+    if bridge_running_inner() {
+        return ActionResult {
+            ok: false,
+            action: "feishu".into(),
+            message: "桥已经在运行".into(),
+            output: String::new(),
+        };
+    }
+    let allowed = allowed_users.trim().to_string();
+    if allowed.is_empty() {
+        return ActionResult {
+            ok: false,
+            action: "feishu".into(),
+            message: "请先填白名单 open_id（ou_ 开头）。留空等于对所有人开放本机执行权限，所以不允许启动。".into(),
+            output: String::new(),
+        };
+    }
+
+    let script = match bridge_script_path(&app) {
+        Ok(p) => p,
+        Err(e) => {
+            return ActionResult {
+                ok: false,
+                action: "feishu".into(),
+                message: e,
+                output: String::new(),
+            }
+        }
+    };
+    let profile = profile.unwrap_or_else(|| "headless".into());
+
+    let _ = app.emit("harness-output", "$ feishu-bridge （飞书 → dsh）".to_string());
+
+    match Command::new("cmd")
+        .arg("/c")
+        .arg("node")
+        .arg(&script)
+        .env("FEISHU_ALLOWED_USERS", &allowed)
+        .env("DSH_BRIDGE_PROFILE", &profile)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+    {
+        Ok(mut child) => {
+            pipe_to_terminal(&app, &mut child);
+            *BRIDGE_CHILD.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(child);
+            ActionResult {
+                ok: true,
+                action: "feishu".into(),
+                message: format!("桥已启动（profile={profile}，白名单 {allowed}）"),
+                output: String::new(),
+            }
+        }
+        Err(e) => ActionResult {
+            ok: false,
+            action: "feishu".into(),
+            message: format!("启动失败: {e}"),
+            output: String::new(),
+        },
+    }
+}
+
+#[tauri::command]
+fn feishu_bridge_stop() -> ActionResult {
+    let taken = BRIDGE_CHILD
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .take();
+    match taken {
+        Some(mut child) => {
+            let pid = child.id();
+            // Kill the tree: we launch through cmd, so the node process is a child.
+            let _ = Command::new("cmd")
+                .args(["/c", "taskkill", "/PID", &pid.to_string(), "/F", "/T"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+            let _ = child.wait();
+            ActionResult {
+                ok: true,
+                action: "feishu".into(),
+                message: "桥已停止".into(),
+                output: String::new(),
+            }
+        }
+        None => ActionResult {
+            ok: false,
+            action: "feishu".into(),
+            message: "桥没有在运行".into(),
+            output: String::new(),
+        },
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     detach_from_job_if_needed();
@@ -1478,6 +1633,9 @@ pub fn run() {
             remove_plugin,
             upgrade_plugins,
             plugin_op_running,
+            feishu_bridge_status,
+            feishu_bridge_start,
+            feishu_bridge_stop,
             harness_running,
             quit_app
         ])

@@ -75,6 +75,11 @@ interface ProfilePlugins {
   error: string | null;
 }
 
+interface BridgeStatus {
+  running: boolean;
+  script: string;
+}
+
 /** Where this machine serves the harness web UI. */
 const HARNESS_PORT = 3080;
 
@@ -100,6 +105,10 @@ let usageTimer: number | null = null;
 const profiles = ref<ProfilePlugins[]>([]);
 const activeProfile = ref("web");
 const newPlugin = ref("");
+/** Feishu → dsh bridge. */
+const bridgeRunning = ref(false);
+const bridgeUsers = ref("");
+const bridgeProfile = ref("headless");
 
 let unlisten: UnlistenFn | null = null;
 let unlistenHarness: UnlistenFn | null = null;
@@ -161,6 +170,44 @@ async function refreshPlugins() {
 const currentProfile = computed(
   () => profiles.value.find((p) => p.profile === activeProfile.value) ?? null,
 );
+
+/** Whether the Feishu → dsh bridge process is alive. */
+async function refreshBridge() {
+  try {
+    bridgeRunning.value = (await invoke<BridgeStatus>("feishu_bridge_status")).running;
+  } catch {
+    // only affects the button label
+  }
+}
+
+async function startBridge() {
+  busy.value = "feishu";
+  try {
+    const r = await invoke<ActionResult>("feishu_bridge_start", {
+      allowedUsers: bridgeUsers.value,
+      profile: bridgeProfile.value,
+    });
+    say(r.ok ? "ok" : "err", r.message);
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
+    await refreshBridge();
+  }
+}
+
+async function stopBridge() {
+  busy.value = "feishu";
+  try {
+    const r = await invoke<ActionResult>("feishu_bridge_stop");
+    say(r.ok ? "ok" : "err", r.message);
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
+    await refreshBridge();
+  }
+}
 
 async function installPlugin() {
   const name = newPlugin.value.trim();
@@ -413,6 +460,7 @@ onMounted(async () => {
   await refreshBalance();
   await refreshUsage();
   await refreshPlugins();
+  await refreshBridge();
   usageTimer = window.setInterval(() => {
     if (harnessUp.value) {
       void refreshBalance();
@@ -607,6 +655,51 @@ onUnmounted(() => {
       <p class="hint">
         等价于在该 profile 目录执行 <code>dsh plugin --profile {{ activeProfile }} add &lt;包名&gt;</code>
         （本质是 pnpm）。<b>装/卸后需要重启 Web 端才生效</b>，进度见下方终端。
+      </p>
+    </details>
+
+    <details class="plugins">
+      <summary>
+        飞书远程控制 · {{ bridgeRunning ? "运行中" : "已停止" }}
+        <span class="term-actions">
+          <button class="tiny" :disabled="!!busy" @click.prevent="refreshBridge">刷新</button>
+        </span>
+      </summary>
+
+      <div class="setting-row">
+        <input
+          v-model="bridgeUsers"
+          class="path mono"
+          type="text"
+          spellcheck="false"
+          placeholder="白名单 open_id（ou_ 开头，逗号分隔）"
+        />
+      </div>
+      <div class="setting-row">
+        <input
+          v-model="bridgeProfile"
+          class="path mono"
+          type="text"
+          spellcheck="false"
+          placeholder="dsh profile"
+          style="max-width: 110px"
+        />
+        <button
+          class="tiny"
+          :class="{ danger: bridgeRunning }"
+          :disabled="!!busy"
+          @click.prevent="bridgeRunning ? stopBridge() : startBridge()"
+        >
+          {{ bridgeRunning ? "停止桥" : "启动桥" }}
+        </button>
+      </div>
+      <p class="hint">
+        在飞书里给机器人发消息 → 本机执行
+        <code>dsh --profile {{ bridgeProfile || "headless" }}</code> → 结果回飞书。运行日志见下方终端。
+      </p>
+      <p class="hint">
+        ⚠️ 白名单必填：飞书消息等于本机执行权限。另外每条消息是<b>独立任务</b>（headless 无会话延续），
+        且需要先用 <code>lark-cli config init</code> 绑定飞书应用。
       </p>
     </details>
 
