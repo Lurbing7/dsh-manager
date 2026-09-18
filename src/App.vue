@@ -80,6 +80,23 @@ interface BridgeStatus {
   script: string;
 }
 
+interface HermesPlatform {
+  name: string;
+  state: string;
+  needs_attention: boolean;
+}
+
+interface HermesStatus {
+  ok: boolean;
+  gateway_state: string;
+  code_version: string;
+  active_agents: number;
+  pid: number;
+  platforms: HermesPlatform[];
+  source: string;
+  error: string | null;
+}
+
 /** Where this machine serves the harness web UI. */
 const HARNESS_PORT = 3080;
 
@@ -109,6 +126,8 @@ const newPlugin = ref("");
 const bridgeRunning = ref(false);
 const bridgeUsers = ref("");
 const bridgeProfile = ref("headless");
+/** Hermes gateway (read-only). */
+const hermes = ref<HermesStatus | null>(null);
 
 let unlisten: UnlistenFn | null = null;
 let unlistenHarness: UnlistenFn | null = null;
@@ -295,6 +314,35 @@ async function checkUpdate() {
   }
 }
 
+/** Read the Hermes gateway state file (never writes to it). */
+async function refreshHermes() {
+  try {
+    hermes.value = await invoke<HermesStatus>("hermes_status");
+  } catch (e) {
+    hermes.value = null;
+    say("err", String(e));
+  }
+}
+
+async function openHermes() {
+  try {
+    const r = await invoke<ActionResult>("open_hermes_page");
+    say(r.ok ? "ok" : "err", r.message);
+  } catch (e) {
+    say("err", String(e));
+  }
+}
+
+/** Reopen the harness web UI - the way back after closing the browser tab. */
+async function openPage() {
+  try {
+    const r = await invoke<ActionResult>("open_harness_page", { port: HARNESS_PORT });
+    say(r.ok ? "ok" : "err", r.message);
+  } catch (e) {
+    say("err", String(e));
+  }
+}
+
 /** Start the dsh WEB harness inside the panel (no separate console window). */
 async function startHarnessWeb() {
   busy.value = "harness";
@@ -461,6 +509,7 @@ onMounted(async () => {
   await refreshUsage();
   await refreshPlugins();
   await refreshBridge();
+  await refreshHermes();
   usageTimer = window.setInterval(() => {
     if (harnessUp.value) {
       void refreshBalance();
@@ -501,6 +550,15 @@ onUnmounted(() => {
         <span class="label">Web 端</span>
         <span class="value" :class="{ off: harnessUp === false }">
           {{ harnessUp === null ? "检测中…" : harnessText }}
+          <button
+            v-if="harnessUp"
+            class="tiny"
+            :disabled="!!busy"
+            title="在默认浏览器里打开 http://127.0.0.1:3080"
+            @click="openPage"
+          >
+            打开网页
+          </button>
         </span>
       </div>
       <div class="row">
@@ -700,6 +758,42 @@ onUnmounted(() => {
       <p class="hint">
         ⚠️ 白名单必填：飞书消息等于本机执行权限。另外每条消息是<b>独立任务</b>（headless 无会话延续），
         且需要先用 <code>lark-cli config init</code> 绑定飞书应用。
+      </p>
+    </details>
+
+    <details class="plugins">
+      <summary>
+        Hermes 网关 · {{ hermes?.ok ? hermes.gateway_state : "不可用" }}
+        <span class="term-actions">
+          <button class="tiny" :disabled="!!busy" @click.prevent="refreshHermes">刷新</button>
+          <button class="tiny" :disabled="!!busy" @click.prevent="openHermes">打开面板</button>
+        </span>
+      </summary>
+
+      <div v-if="hermes?.ok">
+        <div class="row">
+          <span class="label">版本 / PID</span>
+          <span class="value mono">{{ hermes.code_version }} · {{ hermes.pid }}</span>
+        </div>
+        <div class="row">
+          <span class="label">活跃 Agent</span>
+          <span class="value mono">{{ hermes.active_agents }}</span>
+        </div>
+        <div v-for="p in hermes.platforms" :key="p.name" class="row">
+          <span class="label">{{ p.name }}</span>
+          <span
+            class="value"
+            :class="{ off: p.state !== 'connected', hl: p.state === 'connected' }"
+          >
+            {{ p.state }}{{ p.needs_attention ? " · 需要注意" : "" }}
+          </span>
+        </div>
+      </div>
+      <p v-else class="hint err">{{ hermes?.error ?? "读不到 Hermes 状态" }}</p>
+
+      <p class="hint">
+        Hermes 是跑在 Docker 里的另一个 AI Agent（自带多平台网关，包括飞书）。这里**只读**它的状态，
+        不做启停 —— 要改配置请用 <code>docker compose --profile ai</code>。
       </p>
     </details>
 

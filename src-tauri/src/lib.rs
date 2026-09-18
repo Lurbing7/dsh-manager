@@ -1528,6 +1528,134 @@ fn feishu_bridge_stop() -> ActionResult {
     }
 }
 
+/// Open the harness web UI in the default browser. Pure navigation - never
+/// starts anything, so it is safe to press even when the state is unknown.
+#[tauri::command]
+fn open_harness_page(port: Option<u16>) -> ActionResult {
+    let port = port.unwrap_or(DEFAULT_HARNESS_PORT);
+    let url = harness_url(port);
+    // `start` treats the first quoted argument as a window title, hence the "".
+    match Command::new("cmd")
+        .args(["/c", "start", "", &url])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+    {
+        Ok(_) => ActionResult {
+            ok: true,
+            action: "browser".into(),
+            message: format!("已在浏览器打开 {url}"),
+            output: String::new(),
+        },
+        Err(e) => ActionResult {
+            ok: false,
+            action: "browser".into(),
+            message: format!("打开浏览器失败: {e}"),
+            output: String::new(),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hermes gateway (read-only status)
+// ---------------------------------------------------------------------------
+
+/// Host path of the Hermes gateway state file (the docker volume
+/// `docker/hermes/data` mounted at `/opt/data` inside the container).
+const HERMES_STATE_FILE: &str = r"C:\workspace\docker\hermes\data\gateway_state.json";
+const HERMES_DASHBOARD_PORT: u16 = 9119;
+
+#[derive(Serialize, Clone)]
+struct HermesPlatform {
+    name: String,
+    state: String,
+    needs_attention: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct HermesStatus {
+    ok: bool,
+    gateway_state: String,
+    code_version: String,
+    active_agents: u64,
+    pid: u64,
+    platforms: Vec<HermesPlatform>,
+    /// File the reading came from (empty if we could not read it).
+    source: String,
+    error: Option<String>,
+}
+
+/// Read (never write) the gateway state so the panel can show whether the
+/// Hermes bridge is up and which platforms are connected.
+#[tauri::command]
+fn hermes_status() -> HermesStatus {
+    let fail = |err: String| HermesStatus {
+        ok: false,
+        gateway_state: String::new(),
+        code_version: String::new(),
+        active_agents: 0,
+        pid: 0,
+        platforms: Vec::new(),
+        source: String::new(),
+        error: Some(err),
+    };
+
+    let text = match std::fs::read_to_string(HERMES_STATE_FILE) {
+        Ok(t) => t,
+        Err(e) => return fail(format!("读不到 Hermes 状态文件: {e}")),
+    };
+    let v: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return fail(format!("解析 Hermes 状态失败: {e}")),
+    };
+
+    let mut platforms = Vec::new();
+    if let Some(map) = v["platforms"].as_object() {
+        for (name, p) in map {
+            platforms.push(HermesPlatform {
+                name: name.clone(),
+                state: p["state"].as_str().unwrap_or("unknown").to_string(),
+                needs_attention: p["needs_attention"].as_bool().unwrap_or(false),
+            });
+        }
+        platforms.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    HermesStatus {
+        ok: true,
+        gateway_state: v["gateway_state"].as_str().unwrap_or("unknown").to_string(),
+        code_version: v["code_version"].as_str().unwrap_or("").to_string(),
+        active_agents: v["active_agents"].as_u64().unwrap_or(0),
+        pid: v["pid"].as_u64().unwrap_or(0),
+        platforms,
+        source: HERMES_STATE_FILE.to_string(),
+        error: None,
+    }
+}
+
+/// Open the Hermes dashboard in the browser.
+#[tauri::command]
+fn open_hermes_page() -> ActionResult {
+    let url = format!("http://127.0.0.1:{HERMES_DASHBOARD_PORT}");
+    match Command::new("cmd")
+        .args(["/c", "start", "", &url])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+    {
+        Ok(_) => ActionResult {
+            ok: true,
+            action: "browser".into(),
+            message: format!("已在浏览器打开 {url}"),
+            output: String::new(),
+        },
+        Err(e) => ActionResult {
+            ok: false,
+            action: "browser".into(),
+            message: format!("打开浏览器失败: {e}"),
+            output: String::new(),
+        },
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     detach_from_job_if_needed();
@@ -1636,6 +1764,9 @@ pub fn run() {
             feishu_bridge_status,
             feishu_bridge_start,
             feishu_bridge_stop,
+            open_harness_page,
+            hermes_status,
+            open_hermes_page,
             harness_running,
             quit_app
         ])
