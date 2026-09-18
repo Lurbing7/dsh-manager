@@ -687,30 +687,139 @@ async fn start_harness_inline(app: AppHandle, port: Option<u16>) -> ActionResult
     }
 }
 
-/// Stop the harness process the panel started (only affects the inline one).
+/// PIDs LISTENING on a TCP port, via Windows `netstat -ano`.
+fn pids_on_port(port: u16) -> Vec<u32> {
+    let Ok(out) = Command::new("cmd")
+        .args(["/c", "netstat", "-ano", "-p", "tcp"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let suffix = format!(":{port}");
+    let mut pids: Vec<u32> = Vec::new();
+    for line in text.lines() {
+        if !line.contains("LISTENING") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 5 || !cols[1].ends_with(&suffix) {
+            continue;
+        }
+        if let Ok(pid) = cols[4].parse::<u32>() {
+            if !pids.contains(&pid) {
+                pids.push(pid);
+            }
+        }
+    }
+    pids
+}
+
+/// Image name for a PID. Used so we never kill something unrelated that merely
+/// happens to hold the port.
+fn process_name(pid: u32) -> Option<String> {
+    let out = Command::new("cmd")
+        .args([
+            "/c",
+            "tasklist",
+            "/FI",
+            &format!("PID eq {pid}"),
+            "/FO",
+            "CSV",
+            "/NH",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let first = text.lines().next()?.trim().to_string();
+    if first.is_empty() || first.starts_with("INFO:") {
+        return None;
+    }
+    first.split(',').next().map(|s| s.trim_matches('"').to_string())
+}
+
+/// Stop the harness. Prefers the child the panel launched; otherwise stops
+/// whatever node process is listening on the port (that is how a harness started
+/// elsewhere - a terminal, another tool - gets stopped from here).
 #[tauri::command]
-fn stop_harness() -> ActionResult {
-    let stopped = HARNESS_CHILD
+fn stop_harness(port: Option<u16>) -> ActionResult {
+    let port = port.unwrap_or(DEFAULT_HARNESS_PORT);
+
+    if let Some(mut child) = HARNESS_CHILD
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap()
         .take()
-        .map(|mut c| {
-            let _ = c.kill();
-            let _ = c.wait();
-            true
-        })
-        .unwrap_or(false);
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return ActionResult {
+            ok: true,
+            action: "stop".into(),
+            message: "已停止面板启动的 Web 端".into(),
+            output: String::new(),
+        };
+    }
 
-    ActionResult {
-        ok: stopped,
-        action: "stop".into(),
-        message: if stopped {
-            "已停止面板启动的 harness".into()
+    let pids = pids_on_port(port);
+    if pids.is_empty() {
+        return ActionResult {
+            ok: false,
+            action: "stop".into(),
+            message: format!("端口 {port} 上没有在监听的进程"),
+            output: String::new(),
+        };
+    }
+
+    let mut killed: Vec<u32> = Vec::new();
+    let mut refused: Vec<u32> = Vec::new();
+    for pid in pids {
+        let is_node = process_name(pid)
+            .map(|n| n.eq_ignore_ascii_case("node.exe"))
+            .unwrap_or(false);
+        if !is_node {
+            refused.push(pid);
+            continue;
+        }
+        let ok = Command::new("cmd")
+            .args(["/c", "taskkill", "/PID", &pid.to_string(), "/F", "/T"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            killed.push(pid);
         } else {
-            "没有由面板启动的 harness（可能在别处运行）".into()
+            refused.push(pid);
+        }
+    }
+
+    let join = |v: &[u32]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
+    ActionResult {
+        ok: !killed.is_empty(),
+        action: "stop".into(),
+        message: if !killed.is_empty() {
+            format!("已停止占用端口 {port} 的 harness（PID {}）", join(&killed))
+        } else {
+            format!("端口 {port} 被非 node 进程占用（PID {}），没有动它", join(&refused))
         },
         output: String::new(),
+    }
+}
+
+/// Whether the desktop app the panel launched is still alive.
+#[tauri::command]
+fn desktop_running() -> bool {
+    match DESKTOP_CHILD
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .as_mut()
+    {
+        Some(child) => matches!(child.try_wait(), Ok(None)),
+        None => false,
     }
 }
 
@@ -933,6 +1042,7 @@ pub fn run() {
             set_desktop_source_dir,
             start_desktop_app,
             stop_desktop_app,
+            desktop_running,
             harness_running,
             quit_app
         ])

@@ -45,6 +45,8 @@ const toast = ref<{ kind: "info" | "ok" | "err"; text: string } | null>(null);
 const logText = ref("");
 /** null = not known yet (the poller fills it in within one tick). */
 const harnessUp = ref<boolean | null>(null);
+/** Whether the desktop app the panel launched is still alive. */
+const desktopUp = ref(false);
 /** Live console output from whatever the panel launched. */
 const termLines = ref<string[]>([]);
 const termEl = ref<HTMLElement | null>(null);
@@ -114,7 +116,7 @@ async function checkUpdate() {
 }
 
 /** Start the dsh WEB harness inside the panel (no separate console window). */
-async function openHarness() {
+async function startHarnessWeb() {
   busy.value = "harness";
   say("info", "正在确认 Web 端是否在运行…");
   try {
@@ -125,6 +127,25 @@ async function openHarness() {
   } finally {
     busy.value = null;
   }
+}
+
+/** Stop whatever serves the harness port - panel-launched or not. */
+async function stopHarnessWeb() {
+  busy.value = "stop";
+  say("info", "正在停止 Web 端…");
+  try {
+    const r = await invoke<ActionResult>("stop_harness", { port: HARNESS_PORT });
+    say(r.ok ? "ok" : "err", r.message);
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
+  }
+}
+
+async function toggleHarness() {
+  if (harnessUp.value) await stopHarnessWeb();
+  else await startHarnessWeb();
 }
 
 /** Pick the source root with a folder dialog, then persist it. */
@@ -143,6 +164,14 @@ async function pickSourceDir() {
   }
 }
 
+async function refreshDesktopState() {
+  try {
+    desktopUp.value = await invoke<boolean>("desktop_running");
+  } catch {
+    // ignore - only affects the button label
+  }
+}
+
 /** Start the Electron DESKTOP app from the configured source checkout. */
 async function startDesktop() {
   busy.value = "desktop";
@@ -157,6 +186,7 @@ async function startDesktop() {
   try {
     const r = await invoke<ActionResult>("start_desktop_app");
     say(r.ok ? "ok" : "err", r.message);
+    if (r.ok) desktopUp.value = true;
   } catch (e) {
     say("err", String(e));
   } finally {
@@ -164,16 +194,22 @@ async function startDesktop() {
   }
 }
 
-async function stopChild(which: "harness" | "desktop") {
+async function stopDesktop() {
   busy.value = "stop";
   try {
-    const r = await invoke<ActionResult>(which === "harness" ? "stop_harness" : "stop_desktop_app");
+    const r = await invoke<ActionResult>("stop_desktop_app");
     say(r.ok ? "ok" : "err", r.message);
   } catch (e) {
     say("err", String(e));
   } finally {
     busy.value = null;
+    await refreshDesktopState();
   }
+}
+
+async function toggleDesktop() {
+  if (desktopUp.value) await stopDesktop();
+  else await startDesktop();
 }
 
 async function upgrade() {
@@ -215,10 +251,12 @@ const statusText = computed(() => {
 });
 
 const harnessText = computed(() => (harnessUp.value ? "运行中" : "未启动"));
+const webBusy = computed(() => busy.value === "harness" || busy.value === "stop");
 
 onMounted(async () => {
   await refreshLocal();
   await loadSettings();
+  await refreshDesktopState();
   // Fired by the background daily sweep and the tray menu.
   unlisten = await listen<UpdateInfo>("update-checked", (e) => {
     update.value = e.payload;
@@ -287,15 +325,20 @@ onUnmounted(() => {
     </section>
 
     <section class="actions">
-      <!-- 1. web harness -->
+      <!-- 1. web harness: start when down, red stop when up -->
       <button
         class="primary"
+        :class="{ danger: harnessUp === true }"
         :disabled="!!busy"
-        title="在面板内启动 dsh web --port 3080"
-        @click="openHarness"
+        :title="
+          harnessUp === true
+            ? '停止占用 3080 端口的 harness（会中断正在使用它的会话）'
+            : '在面板内启动 dsh web --port 3080'
+        "
+        @click="toggleHarness"
       >
-        <span v-if="busy === 'harness'" class="spinner"></span>
-        {{ busy === "harness" ? "启动中…" : "启动 Web 端" }}
+        <span v-if="webBusy" class="spinner"></span>
+        {{ busy === "stop" ? "停止中…" : harnessUp === true ? "停止 Web 端" : busy === "harness" ? "启动中…" : "启动 Web 端" }}
       </button>
 
       <!-- 2. desktop source path + browse -->
@@ -314,15 +357,16 @@ onUnmounted(() => {
         </button>
       </div>
 
-      <!-- 3. desktop launch -->
+      <!-- 3. desktop launch: start / red stop -->
       <button
         class="wide"
+        :class="{ danger: desktopUp }"
         :disabled="!!busy"
-        title="在源码目录执行 pnpm run dev:desktop"
-        @click="startDesktop"
+        :title="desktopUp ? '停止面板启动的桌面端' : '在源码目录执行 pnpm run dev:desktop'"
+        @click="toggleDesktop"
       >
-        <span v-if="busy === 'desktop'" class="spinner"></span>
-        {{ busy === "desktop" ? "启动中…" : "启动桌面端" }}
+        <span v-if="busy === 'desktop' || (desktopUp && busy === 'stop')" class="spinner"></span>
+        {{ desktopUp ? "停止桌面端" : busy === "desktop" ? "启动中…" : "启动桌面端" }}
       </button>
 
       <p class="hint desktop-hint">
@@ -350,8 +394,8 @@ onUnmounted(() => {
       <summary>
         <span>终端 · {{ termLines.length }} 行</span>
         <span class="term-actions">
-          <button class="tiny" :disabled="!!busy" @click.prevent="stopChild('harness')">停 Web</button>
-          <button class="tiny" :disabled="!!busy" @click.prevent="stopChild('desktop')">停桌面</button>
+          <button class="tiny" :disabled="!!busy" @click.prevent="stopHarnessWeb">停 Web</button>
+          <button class="tiny" :disabled="!!busy" @click.prevent="stopDesktop">停桌面</button>
         </span>
       </summary>
       <pre ref="termEl">{{ termLines.join("\n") }}</pre>
