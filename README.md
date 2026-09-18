@@ -127,3 +127,7 @@ src-tauri/
 - 升级后**必须重启正在运行的 harness** 才生效——升级的是它自己。如果 harness 正在跑，Windows 上文件可能被占用，npm 会报 `EBUSY`/`EPERM`，应用会把这种情况翻成一句人话提示。
 - 应用自身不自动更新，只检测 dsh。
 - 端口写死 `3080`（改的话是 `src-tauri/src/lib.rs` 的 `DEFAULT_HARNESS_PORT` 和 `src/App.vue` 的 `HARNESS_PORT`，两处要一起改）。
+
+## License
+
+MIT —— 见 [LICENSE](LICENSE)。
