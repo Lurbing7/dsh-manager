@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "dsh-panel",
+  "productName": "dsh-manager",
   "version": "0.1.0",
   "identifier": "com.dshpanel.app",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "DSH Panel",
+        "title": "DSH Manager",
         "label": "main",
         "width": 1280,
         "height": 720,

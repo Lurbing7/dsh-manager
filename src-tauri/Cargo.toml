@@ -1,5 +1,5 @@
 [package]
-name = "dsh-panel"
+name = "dsh-manager"
 version = "0.1.0"
 description = "DeepSeek Harness desktop panel: update check + one-click launch"
 authors = ["you"]

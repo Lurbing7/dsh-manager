@@ -43,9 +43,11 @@ if (-not $SkipIcons) {
 }
 
 Write-Output "== dropping the build-script cache so the icon resource is re-embedded =="
-Get-ChildItem 'src-tauri\target\release\build' -Directory -Filter 'dsh-panel-*' -ErrorAction SilentlyContinue |
+# Filter follows the crate name (dsh-manager after the rename): a stale filter
+# silently matches nothing, and the old icon keeps getting embedded.
+Get-ChildItem 'src-tauri\target\release\build' -Directory -Filter 'dsh-manager-*' -ErrorAction SilentlyContinue |
     ForEach-Object { Remove-Item $_.FullName -Recurse -Force }
-Get-ChildItem 'src-tauri\target\release\.fingerprint' -Directory -Filter 'dsh-panel-*' -ErrorAction SilentlyContinue |
+Get-ChildItem 'src-tauri\target\release\.fingerprint' -Directory -Filter 'dsh-manager-*' -ErrorAction SilentlyContinue |
     ForEach-Object { Remove-Item $_.FullName -Recurse -Force }
 
 Write-Output "== building =="

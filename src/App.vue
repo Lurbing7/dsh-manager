@@ -232,19 +232,6 @@ async function setAnalysisRange(days: number) {
   await analysisRef.value?.load();
 }
 
-async function importUsage() {
-  busy.value = "import";
-  try {
-    const r = await invoke<ActionResult>("import_plugin_usage");
-    say(r.ok ? "ok" : "err", r.message);
-    await refreshSeries();
-  } catch (e) {
-    say("err", String(e));
-  } finally {
-    busy.value = null;
-  }
-}
-
 const checkedText = computed(() => {
   const t = update.value?.checked_at;
   if (!t) return "从未检查";
@@ -537,19 +524,6 @@ onMounted(async () => {
   await refreshBalance();
   await refreshSeries();
 
-  // First run: seed the local store from the plugin while it is still installed.
-  try {
-    if ((series.value?.filled ?? 0) === 0) {
-      const r = await invoke<ActionResult>("import_plugin_usage");
-      if (r.ok) {
-        say("ok", r.message);
-        await refreshSeries();
-      }
-    }
-  } catch {
-    /* no plugin / no harness - the chart just stays empty */
-  }
-
   unlisten = await listen<UpdateInfo>("update-checked", (e) => {
     update.value = e.payload;
   });
@@ -599,7 +573,7 @@ onUnmounted(() => {
       <header class="dash-head">
         <div class="brand">
           <span class="dot" :class="statusClass"></span>
-          <h1>DSH Panel</h1>
+          <h1>Dashboard</h1>
           <span class="status-pill">{{ statusText }}</span>
         </div>
         <button class="ghost" title="重新载入数据" @click="refreshSeries">刷新</button>
@@ -754,13 +728,10 @@ onUnmounted(() => {
             <button class="btn-sm" :disabled="!!busy" @click="installPlugin">安装</button>
           </div>
           <p class="hint">
-            装/卸后需重启 Web 端才生效。面板的用量统计不再依赖插件（内核自带 token 计量），
-            可以安全卸载。
+            装/卸后需重启 Web 端才生效。面板的用量统计不依赖插件（直接解析 harness 的会话日志）。
           </p>
           <div class="btn-row">
-            <button :disabled="!!busy" @click="importUsage">
-              <span v-if="busy === 'import'" class="spinner"></span>导入插件历史用量
-            </button>
+            <button :disabled="!!busy" @click="scanSessions">从会话日志刷新用量</button>
           </div>
         </section>
 
