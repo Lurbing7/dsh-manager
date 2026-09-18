@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import UsageChart from "./components/UsageChart.vue";
+import UsageAnalysis from "./components/UsageAnalysis.vue";
 import type { UsagePoint } from "./types";
 
 interface LocalInfo {
@@ -103,6 +104,9 @@ const update = ref<UpdateInfo | null>(null);
 const balance = ref<BalanceInfo | null>(null);
 const series = ref<UsageSeries | null>(null);
 const bucket = ref<"day" | "week" | "month">("day");
+/** Range for the analysis block below the curve (days; 0 = everything). */
+const analysisRange = ref(30);
+const analysisRef = ref<InstanceType<typeof UsageAnalysis> | null>(null);
 const sourceDir = ref("");
 const busy = ref<string | null>(null);
 const toast = ref<{ kind: "info" | "ok" | "err"; text: string } | null>(null);
@@ -203,6 +207,11 @@ async function refreshSeries() {
 async function setBucket(next: "day" | "week" | "month") {
   bucket.value = next;
   await refreshSeries();
+}
+
+async function setAnalysisRange(days: number) {
+  analysisRange.value = days;
+  await analysisRef.value?.load();
 }
 
 async function importUsage() {
@@ -622,6 +631,17 @@ onUnmounted(() => {
           这 {{ series.points.length }} 个区间里有 {{ series.filled }} 个有用量记录，其余为<strong>空档</strong>（不是零消耗）——空心圆点表示该区间没有数据。
         </p>
       </section>
+
+      <div class="analysis-head">
+        <h2>用量分析</h2>
+        <div class="segmented">
+          <button :class="{ active: analysisRange === 7 }" @click="setAnalysisRange(7)">近 7 天</button>
+          <button :class="{ active: analysisRange === 30 }" @click="setAnalysisRange(30)">近 30 天</button>
+          <button :class="{ active: analysisRange === 90 }" @click="setAnalysisRange(90)">近 90 天</button>
+          <button :class="{ active: analysisRange === 0 }" @click="setAnalysisRange(0)">全部</button>
+        </div>
+      </div>
+      <UsageAnalysis ref="analysisRef" :range="analysisRange" />
     </main>
 
     <!-- ============ floating buttons ============ -->
