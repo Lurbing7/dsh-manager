@@ -962,8 +962,60 @@ fn quit_app(app: AppHandle) {
 // Bootstrap
 // ---------------------------------------------------------------------------
 
+/// True when this process belongs to a Windows Job Object.
+#[cfg(windows)]
+fn in_any_job() -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn IsProcessInJob(
+            process: *mut core::ffi::c_void,
+            job: *mut core::ffi::c_void,
+            result: *mut i32,
+        ) -> i32;
+    }
+    let mut result: i32 = 0;
+    // A null job handle asks "is it in ANY job?".
+    let ok = unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut result) };
+    ok != 0 && result != 0
+}
+
+#[cfg(not(windows))]
+fn in_any_job() -> bool {
+    false
+}
+
+/// The harness runs its children inside a Windows Job Object, so a panel started
+/// from a harness session dies together with the harness - no `taskkill` flag can
+/// prevent that, because closing the job terminates every member process.
+///
+/// So: if we find ourselves inside any job, relaunch through explorer.exe (which
+/// is not in that job) and let this instance exit. The env marker keeps it to one
+/// hop, so a genuinely orphaned panel does not loop forever.
+#[cfg(windows)]
+fn detach_from_job_if_needed() {
+    if std::env::var_os("DSH_PANEL_DETACHED").is_some() || !in_any_job() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let spawned = std::process::Command::new("explorer.exe")
+        .arg(&exe)
+        .env("DSH_PANEL_DETACHED", "1")
+        .spawn()
+        .is_ok();
+    if spawned {
+        std::process::exit(0);
+    }
+}
+
+#[cfg(not(windows))]
+fn detach_from_job_if_needed() {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    detach_from_job_if_needed();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
