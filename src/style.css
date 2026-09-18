@@ -371,6 +371,55 @@ button.wide {
   margin-top: 9px;
 }
 
+/* ---------- plugin management ---------- */
+
+.plugins {
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+  font-size: 12px;
+}
+
+.plugins summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  color: var(--muted);
+  outline: none;
+}
+
+.plugin-row {
+  align-items: center;
+  margin-top: 6px;
+  gap: 8px;
+}
+
+.plugin-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 55%;
+  font-size: 11.5px;
+}
+
+.plugin-row .value {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+}
+
+select.path {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+button.tiny.danger {
+  border-color: rgba(240, 97, 109, 0.5);
+  color: var(--err);
+}
+
 /* running state: the launch button becomes a red stop button */
 
 button.primary.danger {

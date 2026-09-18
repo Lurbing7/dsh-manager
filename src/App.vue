@@ -62,6 +62,19 @@ interface UsageSummary {
   error: string | null;
 }
 
+interface PluginInfo {
+  name: string;
+  installed: string;
+  spec: string;
+}
+
+interface ProfilePlugins {
+  profile: string;
+  bundles: string[];
+  plugins: PluginInfo[];
+  error: string | null;
+}
+
 /** Where this machine serves the harness web UI. */
 const HARNESS_PORT = 3080;
 
@@ -83,6 +96,10 @@ const termEl = ref<HTMLElement | null>(null);
 const balance = ref<BalanceInfo | null>(null);
 const usage = ref<UsageSummary | null>(null);
 let usageTimer: number | null = null;
+/** Plugin management: profiles and their third-party packages. */
+const profiles = ref<ProfilePlugins[]>([]);
+const activeProfile = ref("web");
+const newPlugin = ref("");
 
 let unlisten: UnlistenFn | null = null;
 let unlistenHarness: UnlistenFn | null = null;
@@ -125,6 +142,71 @@ async function refreshUsage() {
     usage.value = await invoke<UsageSummary>("get_usage_summary", { days: 7 });
   } catch (e) {
     usage.value = { ok: false, day_tokens: 0, day_cost: 0, week_tokens: 0, week_cost: 0, total_cost: 0, requests: 0, by_model: [], error: String(e) };
+  }
+}
+
+/** Read every profile's installed third-party plugins. */
+async function refreshPlugins() {
+  try {
+    profiles.value = await invoke<ProfilePlugins[]>("list_plugins");
+    if (!profiles.value.some((p) => p.profile === activeProfile.value)) {
+      const first = profiles.value.find((p) => p.profile === "web") ?? profiles.value[0];
+      if (first) activeProfile.value = first.profile;
+    }
+  } catch (e) {
+    say("err", String(e));
+  }
+}
+
+const currentProfile = computed(
+  () => profiles.value.find((p) => p.profile === activeProfile.value) ?? null,
+);
+
+async function installPlugin() {
+  const name = newPlugin.value.trim();
+  if (!name) {
+    say("err", "请填写要安装的包名");
+    return;
+  }
+  busy.value = "plugin";
+  try {
+    const r = await invoke<ActionResult>("install_plugin", {
+      profile: activeProfile.value,
+      package: name,
+    });
+    say(r.ok ? "ok" : "err", r.message);
+    if (r.ok) newPlugin.value = "";
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
+  }
+}
+
+async function removePlugin(name: string) {
+  busy.value = "plugin";
+  try {
+    const r = await invoke<ActionResult>("remove_plugin", {
+      profile: activeProfile.value,
+      package: name,
+    });
+    say(r.ok ? "ok" : "err", r.message);
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
+  }
+}
+
+async function upgradePlugins() {
+  busy.value = "plugin";
+  try {
+    const r = await invoke<ActionResult>("upgrade_plugins", { profile: activeProfile.value });
+    say(r.ok ? "ok" : "err", r.message);
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
   }
 }
 
@@ -330,6 +412,7 @@ onMounted(async () => {
   // (a balance query hits the provider API, so don't hammer it).
   await refreshBalance();
   await refreshUsage();
+  await refreshPlugins();
   usageTimer = window.setInterval(() => {
     if (harnessUp.value) {
       void refreshBalance();
@@ -482,6 +565,49 @@ onUnmounted(() => {
         <span class="value mono">{{ m.tokens.toLocaleString() }} tok · ¥{{ m.cost.toFixed(4) }}</span>
       </div>
       <p class="hint">累计 {{ usage.requests.toLocaleString() }} 次调用 · 总花费 ¥{{ usage.total_cost.toFixed(4) }}（数据来自 harness 的 dsh-usage-plugin）</p>
+    </details>
+
+    <details class="plugins">
+      <summary>
+        插件管理 · {{ currentProfile?.plugins.length ?? 0 }} 个第三方插件
+        <span class="term-actions">
+          <button class="tiny" :disabled="!!busy" @click.prevent="refreshPlugins">刷新</button>
+        </span>
+      </summary>
+
+      <div class="setting-row">
+        <select v-model="activeProfile" class="path mono" @change="refreshPlugins">
+          <option v-for="p in profiles" :key="p.profile" :value="p.profile">{{ p.profile }}</option>
+        </select>
+        <button class="tiny" :disabled="!!busy" @click.prevent="upgradePlugins">全部升级</button>
+      </div>
+
+      <div v-for="p in currentProfile?.plugins ?? []" :key="p.name" class="row plugin-row">
+        <span class="label mono plugin-name" :title="p.name">{{ p.name }}</span>
+        <span class="value mono">
+          {{ p.installed || "未安装" }}
+          <button class="tiny danger" :disabled="!!busy" @click.prevent="removePlugin(p.name)">卸载</button>
+        </span>
+      </div>
+      <p v-if="currentProfile && currentProfile.plugins.length === 0" class="hint">
+        这个 profile 没有第三方插件。
+      </p>
+
+      <div class="setting-row">
+        <input
+          v-model="newPlugin"
+          class="path mono"
+          type="text"
+          spellcheck="false"
+          placeholder="要安装的包名，如 @scope/dsh-xxx"
+          @keyup.enter="installPlugin"
+        />
+        <button class="tiny" :disabled="!!busy" @click.prevent="installPlugin">安装</button>
+      </div>
+      <p class="hint">
+        等价于在该 profile 目录执行 <code>dsh plugin --profile {{ activeProfile }} add &lt;包名&gt;</code>
+        （本质是 pnpm）。<b>装/卸后需要重启 Web 端才生效</b>，进度见下方终端。
+      </p>
     </details>
 
     <details v-if="termLines.length" class="term">

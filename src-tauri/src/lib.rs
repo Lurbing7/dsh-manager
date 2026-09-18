@@ -39,6 +39,8 @@ static TASKBAR_LIGHT: AtomicBool = AtomicBool::new(false);
 static HARNESS_CHILD: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
 /// The Electron desktop app started from source; same deal.
 static DESKTOP_CHILD: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
+/// The in-flight `dsh plugin ...` (pnpm) process, if any.
+static PLUGIN_CHILD: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
 
 fn harness_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/")
@@ -1188,6 +1190,189 @@ async fn get_usage_summary(days: Option<u32>) -> UsageSummary {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Plugin management (thin wrapper over `dsh plugin --profile X ...`, i.e. pnpm)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone)]
+struct PluginInfo {
+    /// Package name, e.g. @feiyang666/dsh-usage-plugin
+    name: String,
+    /// Version actually installed in the profile's node_modules ("" if missing)
+    installed: String,
+    /// Version range recorded in the profile's package.json
+    spec: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ProfilePlugins {
+    profile: String,
+    /// Bundles the profile loads (official ones included).
+    bundles: Vec<String>,
+    /// Third-party packages this profile depends on.
+    plugins: Vec<PluginInfo>,
+    error: Option<String>,
+}
+
+fn profiles_root(app: &AppHandle) -> Option<PathBuf> {
+    // %USERPROFILE%\.dsh\profiles
+    let home = app.path().home_dir().ok()?;
+    Some(home.join(".dsh").join("profiles"))
+}
+
+/// Read the version a package resolved to inside one profile.
+fn installed_version(profile_dir: &PathBuf, name: &str) -> String {
+    let pkg = profile_dir
+        .join("node_modules")
+        .join(name)
+        .join("package.json");
+    std::fs::read_to_string(pkg)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("version").and_then(|x| x.as_str()).map(String::from))
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn list_plugins(app: AppHandle) -> Vec<ProfilePlugins> {
+    let Some(root) = profiles_root(&app) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+
+    for dir in dirs {
+        let name = match dir.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        // `node_modules` is the pnpm store link, not a profile.
+        if name == "node_modules" {
+            continue;
+        }
+        let manifest = dir.join("package.json");
+        if !manifest.is_file() {
+            continue;
+        }
+        let parsed = std::fs::read_to_string(&manifest)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+
+        let Some(v) = parsed else {
+            out.push(ProfilePlugins {
+                profile: name,
+                bundles: Vec::new(),
+                plugins: Vec::new(),
+                error: Some("package.json 解析失败".into()),
+            });
+            continue;
+        };
+
+        let bundles: Vec<String> = v["dsh"]["profile"]["bundles"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        let mut plugins = Vec::new();
+        if let Some(deps) = v["dependencies"].as_object() {
+            for (dep, spec) in deps {
+                plugins.push(PluginInfo {
+                    name: dep.clone(),
+                    installed: installed_version(&dir, dep),
+                    spec: spec.as_str().unwrap_or("").to_string(),
+                });
+            }
+        }
+        plugins.sort_by(|a, b| a.name.cmp(&b.name));
+
+        out.push(ProfilePlugins {
+            profile: name,
+            bundles,
+            plugins,
+            error: None,
+        });
+    }
+    out
+}
+
+/// Run `dsh plugin --profile <p> <args...>` and stream its output to the terminal.
+fn run_dsh_plugin(app: &AppHandle, profile: String, args: Vec<String>) -> ActionResult {
+    let mut cmd = Command::new("cmd");
+    cmd.arg("/c").arg("dsh").arg("plugin").arg("--profile").arg(&profile);
+    for a in &args {
+        cmd.arg(a);
+    }
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW);
+
+    let _ = app.emit("harness-output", format!("$ dsh plugin --profile {profile} {}", args.join(" ")));
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            pipe_to_terminal(app, &mut child);
+            *PLUGIN_CHILD.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(child);
+            ActionResult {
+                ok: true,
+                action: "plugin".into(),
+                message: format!("已开始执行（输出见终端）；装/卸插件后需要重启 Web 端才生效"),
+                output: String::new(),
+            }
+        }
+        Err(e) => ActionResult {
+            ok: false,
+            action: "plugin".into(),
+            message: format!("无法执行 dsh: {e}"),
+            output: String::new(),
+        },
+    }
+}
+
+#[tauri::command]
+async fn install_plugin(app: AppHandle, profile: String, package: String) -> ActionResult {
+    let package = package.trim().to_string();
+    if package.is_empty() {
+        return ActionResult {
+            ok: false,
+            action: "plugin".into(),
+            message: "请填写包名，例如 @scope/dsh-xxx".into(),
+            output: String::new(),
+        };
+    }
+    run_dsh_plugin(&app, profile, vec!["add".into(), package])
+}
+
+#[tauri::command]
+async fn remove_plugin(app: AppHandle, profile: String, package: String) -> ActionResult {
+    run_dsh_plugin(&app, profile, vec!["remove".into(), package])
+}
+
+#[tauri::command]
+async fn upgrade_plugins(app: AppHandle, profile: String) -> ActionResult {
+    run_dsh_plugin(&app, profile, vec!["update".into()])
+}
+
+#[tauri::command]
+fn plugin_op_running() -> bool {
+    match PLUGIN_CHILD
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .as_mut()
+    {
+        Some(child) => matches!(child.try_wait(), Ok(None)),
+        None => false,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     detach_from_job_if_needed();
@@ -1288,6 +1473,11 @@ pub fn run() {
             desktop_running,
             get_balance,
             get_usage_summary,
+            list_plugins,
+            install_plugin,
+            remove_plugin,
+            upgrade_plugins,
+            plugin_op_running,
             harness_running,
             quit_app
         ])
