@@ -36,8 +36,11 @@ const update = ref<UpdateInfo | null>(null);
 const busy = ref<string | null>(null);
 const toast = ref<{ kind: "info" | "ok" | "err"; text: string } | null>(null);
 const logText = ref("");
+/** null = not known yet (the poller fills it in within one tick). */
+const harnessUp = ref<boolean | null>(null);
 
 let unlisten: UnlistenFn | null = null;
+let unlistenHarness: UnlistenFn | null = null;
 
 function say(kind: "info" | "ok" | "err", text: string) {
   toast.value = { kind, text };
@@ -118,17 +121,32 @@ const statusText = computed(() => {
   return update.value.has_update ? "有可用更新" : "已是最新";
 });
 
+const harnessText = computed(() => {
+  if (harnessUp.value === null) return "检测中…";
+  return harnessUp.value ? "运行中" : "未启动";
+});
+
 onMounted(async () => {
   await refreshLocal();
   // Fired by the background daily sweep and the tray menu.
   unlisten = await listen<UpdateInfo>("update-checked", (e) => {
     update.value = e.payload;
   });
+  // Fired by the harness port poller (the same one that switches the tray icon).
+  unlistenHarness = await listen<boolean>("harness-state", (e) => {
+    harnessUp.value = e.payload;
+  });
+  try {
+    harnessUp.value = await invoke<boolean>("harness_running");
+  } catch {
+    // the poller will fill this in on its next tick
+  }
   await checkUpdate();
 });
 
 onUnmounted(() => {
   unlisten?.();
+  unlistenHarness?.();
 });
 </script>
 
@@ -151,6 +169,10 @@ onUnmounted(() => {
       <div class="row">
         <span class="label">Node</span>
         <span class="value mono">{{ local?.node_version ?? "—" }}</span>
+      </div>
+      <div class="row">
+        <span class="label">Harness</span>
+        <span class="value" :class="{ off: harnessUp === false }">{{ harnessText }}</span>
       </div>
       <div class="row">
         <span class="label">最新版本</span>

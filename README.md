@@ -26,6 +26,29 @@ DeepSeek Harness 的 Windows 桌面小面板：常驻托盘，只做两件事—
 
 **所以你 `nvm use` 切了版本，这个应用会自动跟着切**——只要那个版本里装了 dsh。
 
+## 图标
+
+**应用图标**：`src-tauri/icons/`，由 `src-tauri/app-icon.png` 经 `npm run tauri icon` 生成（鲸鱼娘 logo，已裁掉右下角水印）。
+
+**托盘图标**：两张，按 harness 是否在运行自动切换，每 10 秒探测一次 `127.0.0.1:3080`（只在状态翻转时重绘并通知界面）：
+
+| 状态 | 图标 |
+|---|---|
+| 未启动 | 暗灰蓝圆底 + 白色躺姿剪影（躺着喝茶） |
+| 运行中 | 亮蓝圆底 + 白色坐姿剪影（在打字） |
+
+颜色 + 形状**双重区分**；加圆底是因为白色剪影放在浅色任务栏上会隐形。
+
+源图在 `tools/source/`，生成脚本：
+
+```powershell
+python tools\make_icons.py preview              # 出对比预览图（tools/preview/，已 gitignore）
+python tools\make_icons.py build                # 生成托盘 ico/png + 应用图标源图
+npm run tauri icon src-tauri\app-icon.png       # 生成全套应用图标
+```
+
+> ⚠️ **源图是开放式线稿**（头发与脸、手与杯子的交界处轮廓有缺口），直接做泛洪填充会从缺口渗进去、填不出剪影。脚本先做**形态学闭运算**（膨胀封口再腐蚀还原）才填充。而且线稿直接缩小到 16px 会**完全消失**（线条只有 1–2 像素宽），必须转成实心剪影。
+
 ## 技术栈
 
 | 层 | 用什么 |
