@@ -15,7 +15,7 @@
         "title": "DSH Panel",
         "label": "main",
         "width": 440,
-        "height": 460,
+        "height": 580,
         "resizable": false,
         "center": true
       }

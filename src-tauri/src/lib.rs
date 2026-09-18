@@ -37,6 +37,8 @@ static TASKBAR_LIGHT: AtomicBool = AtomicBool::new(false);
 /// The harness process started from inside the panel. Kept so its pipes stay
 /// alive; dropping this handle does NOT kill the child process.
 static HARNESS_CHILD: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
+/// The Electron desktop app started from source; same deal.
+static DESKTOP_CHILD: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
 
 fn harness_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/")
@@ -302,6 +304,74 @@ fn check_due(app: &AppHandle) -> bool {
     match load_state(app).and_then(|s| s.last_check_at) {
         Some(t) => now_secs().saturating_sub(t) >= CHECK_INTERVAL_SECS,
         None => true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settings (the source checkout used to launch the Electron desktop app)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct Settings {
+    /// Path to a DeepSeek Harness source checkout. The Electron desktop app is
+    /// not shipped with this panel - it runs from that checkout via
+    /// `pnpm run dev:desktop`.
+    desktop_source_dir: Option<String>,
+}
+
+fn settings_file(app: &AppHandle) -> Option<PathBuf> {
+    let dir = app.path().app_data_dir().ok()?;
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("settings.json"))
+}
+
+fn load_settings(app: &AppHandle) -> Settings {
+    settings_file(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_settings(app: &AppHandle, settings: &Settings) {
+    if let Some(path) = settings_file(app) {
+        if let Ok(txt) = serde_json::to_string_pretty(settings) {
+            let _ = std::fs::write(path, txt);
+        }
+    }
+}
+
+/// A source checkout is usable once it has a manifest and installed deps.
+fn source_dir_problem(dir: &str) -> Option<String> {
+    let root = PathBuf::from(dir);
+    if !root.is_dir() {
+        return Some(format!("目录不存在：{dir}"));
+    }
+    if !root.join("package.json").is_file() {
+        return Some(format!("{dir} 里没有 package.json，不像是 DeepSeek Harness 源码"));
+    }
+    if !root.join("node_modules").is_dir() {
+        return Some(format!("{dir} 还没装依赖，请先在终端执行 pnpm install"));
+    }
+    None
+}
+
+/// Stream a child's stdout/stderr into the panel's embedded terminal.
+fn pipe_to_terminal(app: &AppHandle, child: &mut std::process::Child) {
+    if let Some(out) = child.stdout.take() {
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                let _ = handle.emit("harness-output", line);
+            }
+        });
+    }
+    if let Some(err) = child.stderr.take() {
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                let _ = handle.emit("harness-output", line);
+            }
+        });
     }
 }
 
@@ -644,6 +714,113 @@ fn stop_harness() -> ActionResult {
     }
 }
 
+#[tauri::command]
+fn get_settings(app: AppHandle) -> Settings {
+    load_settings(&app)
+}
+
+/// Save (or clear) the source checkout the desktop app is launched from.
+#[tauri::command]
+fn set_desktop_source_dir(app: AppHandle, dir: Option<String>) -> ActionResult {
+    let mut settings = load_settings(&app);
+    settings.desktop_source_dir = dir
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty());
+    save_settings(&app, &settings);
+
+    ActionResult {
+        ok: true,
+        action: "settings".into(),
+        message: match &settings.desktop_source_dir {
+            Some(d) => format!("已保存源码目录：{d}"),
+            None => "已清除源码目录".into(),
+        },
+        output: String::new(),
+    }
+}
+
+/// Launch the Electron desktop app FROM SOURCE. `dev:desktop` builds the host,
+/// client bundles, web frontend and Electron shell first, so the first run is slow.
+#[tauri::command]
+async fn start_desktop_app(app: AppHandle) -> ActionResult {
+    let Some(dir) = load_settings(&app).desktop_source_dir else {
+        return ActionResult {
+            ok: false,
+            action: "desktop".into(),
+            message: "还没配置源码目录，先在下面的「桌面端源码目录」里选一个".into(),
+            output: String::new(),
+        };
+    };
+
+    if let Some(problem) = source_dir_problem(&dir) {
+        return ActionResult {
+            ok: false,
+            action: "desktop".into(),
+            message: problem,
+            output: String::new(),
+        };
+    }
+
+    let root = PathBuf::from(&dir);
+    let _ = app.emit("harness-output", format!("$ cd {dir}"));
+    let _ = app.emit("harness-output", "$ pnpm run dev:desktop");
+
+    let mut child = match Command::new("cmd")
+        .args(["/c", "pnpm", "run", "dev:desktop"])
+        .current_dir(&root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ActionResult {
+                ok: false,
+                action: "desktop".into(),
+                message: format!("启动失败: {e}"),
+                output: String::new(),
+            }
+        }
+    };
+
+    pipe_to_terminal(&app, &mut child);
+    *DESKTOP_CHILD.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(child);
+
+    ActionResult {
+        ok: true,
+        action: "desktop".into(),
+        message: "已在面板内启动 Electron 桌面端（首次会构建，需要几分钟）".into(),
+        output: String::new(),
+    }
+}
+
+#[tauri::command]
+fn stop_desktop_app() -> ActionResult {
+    let stopped = DESKTOP_CHILD
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .take()
+        .map(|mut c| {
+            let _ = c.kill();
+            let _ = c.wait();
+            true
+        })
+        .unwrap_or(false);
+
+    ActionResult {
+        ok: stopped,
+        action: "stop".into(),
+        message: if stopped {
+            "已停止面板启动的桌面端".into()
+        } else {
+            "没有由面板启动的桌面端".into()
+        },
+        output: String::new(),
+    }
+}
+
 /// Lets the panel render the harness state immediately instead of waiting for
 /// the next poll tick.
 #[tauri::command]
@@ -663,6 +840,7 @@ fn quit_app(app: AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let open_panel = MenuItem::with_id(app, "open_panel", "打开面板", true, None::<&str>)?;
             let launch = MenuItem::with_id(app, "launch", "打开 Harness", true, None::<&str>)?;
@@ -751,6 +929,10 @@ pub fn run() {
             open_harness,
             start_harness_inline,
             stop_harness,
+            get_settings,
+            set_desktop_source_dir,
+            start_desktop_app,
+            stop_desktop_app,
             harness_running,
             quit_app
         ])

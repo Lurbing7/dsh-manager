@@ -319,3 +319,54 @@ button.tiny {
   font-size: 11px;
   padding: 2px 7px;
 }
+
+button.wide {
+  grid-column: 1 / -1;
+}
+
+.term-actions {
+  display: inline-flex;
+  gap: 5px;
+}
+
+/* ---------- settings ---------- */
+
+.settings {
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+  font-size: 12px;
+}
+
+.settings summary {
+  cursor: pointer;
+  color: var(--muted);
+  outline: none;
+}
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+input.path {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text);
+  background: #14161b;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 7px;
+  text-overflow: ellipsis;
+  user-select: text;
+}
+
+.settings code {
+  background: #20242c;
+  border-radius: 3px;
+  padding: 0 4px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 11px;
+}

@@ -18,14 +18,27 @@ param(
     [switch]$SkipIcons
 )
 
-$ErrorActionPreference = 'Stop'
+# NOTE: deliberately NOT $ErrorActionPreference = 'Stop'. The tauri CLI writes its
+# progress to stderr, and PowerShell turns native stderr into a terminating
+# NativeCommandError - that would abort this script partway through the build.
+# Each step's exit code is checked explicitly instead.
+$ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
+
+function Assert-LastExit([string]$step) {
+    if ($LASTEXITCODE -ne 0) {
+        Write-Output "ERROR: $step failed with exit code $LASTEXITCODE"
+        exit $LASTEXITCODE
+    }
+}
 
 if (-not $SkipIcons) {
     Write-Output "== regenerating icons from tools\source =="
     python tools\make_icons.py build
+    Assert-LastExit 'make_icons.py'
     npx tauri icon src-tauri\app-icon.png
+    Assert-LastExit 'tauri icon'
     Remove-Item 'src-tauri\icons\android', 'src-tauri\icons\ios' -Recurse -Force -ErrorAction SilentlyContinue
 }
 
@@ -37,6 +50,7 @@ Get-ChildItem 'src-tauri\target\release\.fingerprint' -Directory -Filter 'dsh-pa
 
 Write-Output "== building =="
 npm run tauri build
+Assert-LastExit 'tauri build'
 
 Write-Output "== installing =="
 if ($Autostart) {
@@ -44,3 +58,5 @@ if ($Autostart) {
 } else {
     & "$PSScriptRoot\install.ps1"
 }
+Assert-LastExit 'install.ps1'
+Write-Output "== done =="
