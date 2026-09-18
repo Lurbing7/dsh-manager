@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
@@ -38,12 +38,26 @@ const toast = ref<{ kind: "info" | "ok" | "err"; text: string } | null>(null);
 const logText = ref("");
 /** null = not known yet (the poller fills it in within one tick). */
 const harnessUp = ref<boolean | null>(null);
+/** Live console output from the harness the panel started. */
+const termLines = ref<string[]>([]);
+const termEl = ref<HTMLElement | null>(null);
 
 let unlisten: UnlistenFn | null = null;
 let unlistenHarness: UnlistenFn | null = null;
+let unlistenTerm: UnlistenFn | null = null;
 
 function say(kind: "info" | "ok" | "err", text: string) {
   toast.value = { kind, text };
+}
+
+async function appendTerm(line: string) {
+  termLines.value.push(line);
+  // keep the buffer bounded - dsh web can be chatty over a long session
+  if (termLines.value.length > 400) {
+    termLines.value.splice(0, termLines.value.length - 400);
+  }
+  await nextTick();
+  if (termEl.value) termEl.value.scrollTop = termEl.value.scrollHeight;
 }
 
 async function refreshLocal() {
@@ -74,7 +88,21 @@ async function openHarness() {
   busy.value = "harness";
   say("info", "正在确认 harness 是否在运行…");
   try {
-    const r = await invoke<ActionResult>("open_harness", { port: HARNESS_PORT });
+    // Starts it INSIDE the panel - output streams into the console below
+    // instead of a separate terminal window popping up.
+    const r = await invoke<ActionResult>("start_harness_inline", { port: HARNESS_PORT });
+    say(r.ok ? "ok" : "err", r.message);
+  } catch (e) {
+    say("err", String(e));
+  } finally {
+    busy.value = null;
+  }
+}
+
+async function stopHarness() {
+  busy.value = "stop";
+  try {
+    const r = await invoke<ActionResult>("stop_harness");
     say(r.ok ? "ok" : "err", r.message);
   } catch (e) {
     say("err", String(e));
@@ -85,7 +113,7 @@ async function openHarness() {
 
 async function upgrade() {
   busy.value = "upgrade";
-  say("info", "正在升级 dsh，请稍候…");
+  say("info", "正在升级 dsh，请稍候…（npm 装包通常要几十秒）");
   try {
     const r = await invoke<ActionResult>("upgrade_dsh");
     logText.value = r.output;
@@ -136,6 +164,10 @@ onMounted(async () => {
   unlistenHarness = await listen<boolean>("harness-state", (e) => {
     harnessUp.value = e.payload;
   });
+  // stdout/stderr of the harness the panel started.
+  unlistenTerm = await listen<string>("harness-output", (e) => {
+    void appendTerm(e.payload);
+  });
   try {
     harnessUp.value = await invoke<boolean>("harness_running");
   } catch {
@@ -147,6 +179,7 @@ onMounted(async () => {
 onUnmounted(() => {
   unlisten?.();
   unlistenHarness?.();
+  unlistenTerm?.();
 });
 </script>
 
@@ -190,9 +223,11 @@ onUnmounted(() => {
 
     <section class="actions">
       <button class="primary" :disabled="!!busy" @click="openHarness">
-        {{ busy === "harness" ? "处理中…" : "打开 Harness" }}
+        <span v-if="busy === 'harness'" class="spinner"></span>
+        {{ busy === "harness" ? "启动中…" : "打开 Harness" }}
       </button>
       <button :disabled="!!busy" @click="checkUpdate">
+        <span v-if="busy === 'check'" class="spinner"></span>
         {{ busy === "check" ? "检查中…" : "检查更新" }}
       </button>
       <button
@@ -201,11 +236,20 @@ onUnmounted(() => {
         :disabled="!!busy || !update?.has_update"
         @click="upgrade"
       >
+        <span v-if="busy === 'upgrade'" class="spinner"></span>
         {{ busy === "upgrade" ? "升级中…" : "一键升级" }}
       </button>
     </section>
 
     <p v-if="toast" class="toast" :class="toast.kind">{{ toast.text }}</p>
+
+    <details v-if="termLines.length" class="term">
+      <summary>
+        <span>Harness 终端 · {{ termLines.length }} 行</span>
+        <button class="ghost tiny" :disabled="!!busy" @click.prevent="stopHarness">停止</button>
+      </summary>
+      <pre ref="termEl">{{ termLines.join("\n") }}</pre>
+    </details>
 
     <details v-if="logText" class="log">
       <summary>npm 输出</summary>

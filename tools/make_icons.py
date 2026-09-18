@@ -19,7 +19,7 @@ from collections import deque
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "tools" / "source"
@@ -141,12 +141,18 @@ TRAY_COLORS = {
 
 
 def render_tray(state: str, theme: str = "dark", size: int = 32) -> Image.Image:
-    """Flat single-colour silhouette with a transparent background."""
-    meta = SOURCES[state]
-    sil = make_silhouette(load_crop(meta["file"], meta["crop"]))
-    tinted = Image.new("RGBA", sil.size, TRAY_COLORS[(state, theme)] + (255,))
-    tinted.putalpha(sil.split()[3])
-    return tinted.resize((size, size), Image.LANCZOS)
+    """Tray icon = the app logo itself.
+
+    The silhouette route was unreadable at 20px (the shapes just read as blobs),
+    so the logo stands in for now. "stopped" is desaturated so the two states
+    stay distinguishable at a glance.
+    """
+    icon = make_app_icon(256).convert("RGBA")
+    if state == "stopped":
+        _r, _g, _b, alpha = icon.split()
+        grey = ImageOps.grayscale(icon.convert("RGB"))
+        icon = Image.merge("RGBA", (grey, grey, grey, alpha))
+    return icon.resize((size, size), Image.LANCZOS)
 
 
 def clean_artwork(img: Image.Image, threshold: int = 244) -> Image.Image:
