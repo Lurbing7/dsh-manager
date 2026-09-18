@@ -2640,6 +2640,35 @@ pub fn run() {
         std::process::exit(0);
     }
 
+    // `dsh-manager.exe --dump-session <file.jsonl.zstd> [out.jsonl]` decompresses
+    // a session log. Session files are multi-frame zstd, which most tooling
+    // (including the loop-guard analyzer) cannot read directly.
+    if let Some(pos) = argv.iter().position(|a| a == "--dump-session") {
+        let message = match argv.get(pos + 1) {
+            None => "usage: --dump-session <session.jsonl.zstd> [out.jsonl]".to_string(),
+            Some(src) => {
+                let out = argv.get(pos + 2).cloned().unwrap_or_else(|| {
+                    std::env::temp_dir()
+                        .join("session-dump.jsonl")
+                        .to_string_lossy()
+                        .to_string()
+                });
+                match read_session_lines(&PathBuf::from(src)) {
+                    Ok(lines) => {
+                        let joined = lines.join("\n");
+                        match std::fs::write(&out, joined) {
+                            Ok(_) => format!("OK {} lines -> {out}", lines.len()),
+                            Err(e) => format!("FAIL writing {out}: {e}"),
+                        }
+                    }
+                    Err(e) => format!("FAIL {e}"),
+                }
+            }
+        };
+        let _ = std::fs::write(std::env::temp_dir().join("dsh-panel-dump.txt"), message);
+        std::process::exit(0);
+    }
+
     // `dsh-panel.exe --scan-sessions-apply [days]` runs the real refresh.
     if let Some(pos) = argv.iter().position(|a| a == "--scan-sessions-apply") {
         let days = argv.get(pos + 1).and_then(|s| s.parse::<u32>().ok());
