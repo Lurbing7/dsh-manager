@@ -324,6 +324,34 @@ button.wide {
   grid-column: 1 / -1;
 }
 
+/* ---------- desktop source row: path box + browse ---------- */
+
+.desktop-row {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.desktop-row input.path {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+button.browse {
+  flex: none;
+  font-size: 12px;
+  padding: 6px 11px;
+}
+
+p.desktop-hint {
+  grid-column: 1 / -1;
+  margin: -2px 0 2px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
 .term-actions {
   display: inline-flex;
   gap: 5px;

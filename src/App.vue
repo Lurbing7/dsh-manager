@@ -38,7 +38,8 @@ const HARNESS_PORT = 3080;
 
 const local = ref<LocalInfo | null>(null);
 const update = ref<UpdateInfo | null>(null);
-const settings = ref<Settings>({ desktop_source_dir: null });
+/** Desktop app source checkout, bound to the input box. */
+const sourceDir = ref("");
 const busy = ref<string | null>(null);
 const toast = ref<{ kind: "info" | "ok" | "err"; text: string } | null>(null);
 const logText = ref("");
@@ -47,7 +48,6 @@ const harnessUp = ref<boolean | null>(null);
 /** Live console output from whatever the panel launched. */
 const termLines = ref<string[]>([]);
 const termEl = ref<HTMLElement | null>(null);
-const settingsOpen = ref(false);
 
 let unlisten: UnlistenFn | null = null;
 let unlistenHarness: UnlistenFn | null = null;
@@ -77,7 +77,21 @@ async function refreshLocal() {
 
 async function loadSettings() {
   try {
-    settings.value = await invoke<Settings>("get_settings");
+    const s = await invoke<Settings>("get_settings");
+    sourceDir.value = s.desktop_source_dir ?? "";
+  } catch (e) {
+    say("err", String(e));
+  }
+}
+
+/** Persist whatever the input box currently holds (empty clears it). */
+async function saveSourceDir() {
+  try {
+    const r = await invoke<ActionResult>("set_desktop_source_dir", {
+      dir: sourceDir.value.trim() || null,
+    });
+    if (!r.ok) say("err", r.message);
+    await loadSettings();
   } catch (e) {
     say("err", String(e));
   }
@@ -113,44 +127,40 @@ async function openHarness() {
   }
 }
 
-/** Start the Electron DESKTOP app from the configured source checkout. */
-async function startDesktop() {
-  busy.value = "desktop";
-  say("info", "正在从源码启动 Electron 桌面端…");
-  try {
-    const r = await invoke<ActionResult>("start_desktop_app");
-    say(r.ok ? "ok" : "err", r.message);
-    if (!r.ok && !settings.value.desktop_source_dir) settingsOpen.value = true;
-  } catch (e) {
-    say("err", String(e));
-  } finally {
-    busy.value = null;
-  }
-}
-
+/** Pick the source root with a folder dialog, then persist it. */
 async function pickSourceDir() {
   try {
     const picked = await open({
       directory: true,
       multiple: false,
-      title: "选择 DeepSeek Harness 源码目录",
+      title: "选择 DeepSeek Harness 源码根目录",
     });
     if (typeof picked !== "string") return;
-    const r = await invoke<ActionResult>("set_desktop_source_dir", { dir: picked });
-    say(r.ok ? "ok" : "err", r.message);
-    await loadSettings();
+    sourceDir.value = picked;
+    await saveSourceDir();
   } catch (e) {
     say("err", String(e));
   }
 }
 
-async function clearSourceDir() {
+/** Start the Electron DESKTOP app from the configured source checkout. */
+async function startDesktop() {
+  busy.value = "desktop";
+  // persist any edit made in the input box before launching
+  await saveSourceDir();
+  if (!sourceDir.value.trim()) {
+    busy.value = null;
+    say("err", "先填源码目录，或点「浏览…」选一个");
+    return;
+  }
+  say("info", "正在从源码启动 Electron 桌面端…");
   try {
-    const r = await invoke<ActionResult>("set_desktop_source_dir", { dir: null });
+    const r = await invoke<ActionResult>("start_desktop_app");
     say(r.ok ? "ok" : "err", r.message);
-    await loadSettings();
   } catch (e) {
     say("err", String(e));
+  } finally {
+    busy.value = null;
   }
 }
 
@@ -186,10 +196,6 @@ async function quit() {
   await invoke("quit_app");
 }
 
-function onToggleSettings(e: Event) {
-  settingsOpen.value = (e.target as HTMLDetailsElement).open;
-}
-
 const checkedText = computed(() => {
   const t = update.value?.checked_at;
   if (!t) return "从未检查";
@@ -209,7 +215,6 @@ const statusText = computed(() => {
 });
 
 const harnessText = computed(() => (harnessUp.value ? "运行中" : "未启动"));
-const sourceText = computed(() => settings.value.desktop_source_dir ?? "未设置");
 
 onMounted(async () => {
   await refreshLocal();
@@ -282,6 +287,7 @@ onUnmounted(() => {
     </section>
 
     <section class="actions">
+      <!-- 1. web harness -->
       <button
         class="primary"
         :disabled="!!busy"
@@ -291,15 +297,38 @@ onUnmounted(() => {
         <span v-if="busy === 'harness'" class="spinner"></span>
         {{ busy === "harness" ? "启动中…" : "启动 Web 端" }}
       </button>
+
+      <!-- 2. desktop source path + browse -->
+      <div class="desktop-row">
+        <input
+          v-model="sourceDir"
+          class="path mono"
+          type="text"
+          spellcheck="false"
+          placeholder="桌面端源码根目录（可粘贴路径）"
+          title="DeepSeek Harness 源码根目录：可直接粘贴路径，或点右侧「浏览…」选择"
+          @change="saveSourceDir"
+        />
+        <button class="browse" :disabled="!!busy" title="选择源码根目录" @click="pickSourceDir">
+          浏览…
+        </button>
+      </div>
+
+      <!-- 3. desktop launch -->
       <button
         class="wide"
         :disabled="!!busy"
-        title="从源码启动 Electron 桌面端（pnpm run dev:desktop）"
+        title="在源码目录执行 pnpm run dev:desktop"
         @click="startDesktop"
       >
         <span v-if="busy === 'desktop'" class="spinner"></span>
         {{ busy === "desktop" ? "启动中…" : "启动桌面端" }}
       </button>
+
+      <p class="hint desktop-hint">
+        桌面端（Electron）从源码启动：该目录需已 <code>pnpm install</code>，首次启动会构建，较慢。
+      </p>
+
       <button :disabled="!!busy" @click="checkUpdate">
         <span v-if="busy === 'check'" class="spinner"></span>
         {{ busy === "check" ? "检查中…" : "检查更新" }}
@@ -316,27 +345,6 @@ onUnmounted(() => {
     </section>
 
     <p v-if="toast" class="toast" :class="toast.kind">{{ toast.text }}</p>
-
-    <details class="settings" :open="settingsOpen" @toggle="onToggleSettings">
-      <summary>设置 · 桌面端源码目录</summary>
-      <div class="setting-row">
-        <input class="path mono" :value="sourceText" readonly title="当前源码目录" />
-        <button class="tiny" :disabled="!!busy" @click.prevent="pickSourceDir">选择…</button>
-        <button
-          v-if="settings.desktop_source_dir"
-          class="tiny"
-          :disabled="!!busy"
-          @click.prevent="clearSourceDir"
-        >
-          清除
-        </button>
-      </div>
-      <p class="hint">
-        Electron 桌面端不随本面板分发，需要一份 <b>DeepSeek Harness 源码</b>：面板会在该目录执行
-        <code>pnpm run dev:desktop</code>（首次会构建 Host / 客户端 / Web 前端 / Electron 壳，比较慢）。
-        该目录需已 <code>pnpm install</code>。
-      </p>
-    </details>
 
     <details v-if="termLines.length" class="term">
       <summary>
