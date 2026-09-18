@@ -228,14 +228,66 @@ def build() -> None:
     print(f"preview        {PREVIEW / 'app-icon-preview.png'}")
 
 
+def rounded(img: Image.Image, radius_ratio: float) -> Image.Image:
+    """Apply a rounded-corner alpha mask (radius as a fraction of the short side)."""
+    w, h = img.size
+    r = max(1, int(min(w, h) * radius_ratio))
+    ss = 4
+    mask = Image.new("L", (w * ss, h * ss), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, w * ss - 1, h * ss - 1), radius=r * ss, fill=255)
+    out = img.convert("RGBA")
+    out.putalpha(mask.resize((w, h), Image.LANCZOS))
+    return out
+
+
+def backup_logo() -> None:
+    """Write rounded, de-framed variants of the logo into the Downloads folder.
+
+    The artwork has two nested frames:
+      layer 1  the outer white margin plus a thin blue rounded outline (the image edge)
+      layer 2  the blue browser window (title bar, window buttons, address bar)
+    Both variants below are 1024x1024 PNG with a rounded alpha mask. The source
+    file is never modified - these are new files next to it.
+    """
+    src = Image.open(SOURCE / APP_SOURCE).convert("RGB")
+    out_dir = Path.home() / "Downloads"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # A: drop layer 1 only - keep the blue browser window intact.
+    a = src.crop((186, 188, 1854, 1855))
+    a = rounded(a, 0.05).resize((1024, 1024), Image.LANCZOS)
+    a_path = out_dir / "dsh-panel-logo-A-keep-browser-window-1024.png"
+    a.save(a_path)
+    print(f"saved {a_path}")
+
+    # B: drop layer 2 as well - keep only the character and the inner frame.
+    # Cropped to a square centred on the character; the ahoge (hair strand) pokes
+    # up into the title bar, so it is necessarily cut here.
+    b = src.crop((387, 565, 387 + 1265, 565 + 1265))
+    b = rounded(b, 0.07).resize((1024, 1024), Image.LANCZOS)
+    b_path = out_dir / "dsh-panel-logo-B-no-windows-1024.png"
+    b.save(b_path)
+    print(f"saved {b_path}")
+
+    # Side-by-side so the choice is easy.
+    sheet = Image.new("RGB", (1024 * 2 + 30, 1024 + 30), (240, 241, 244))
+    sheet.paste(a.convert("RGB"), (10, 10))
+    sheet.paste(b.convert("RGB"), (1024 + 20, 10))
+    sheet_path = out_dir / "dsh-panel-logo-compare.png"
+    sheet.save(sheet_path)
+    print(f"saved {sheet_path}")
+
+
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "preview"
     if mode == "preview":
         preview()
     elif mode == "build":
         build()
+    elif mode == "backup":
+        backup_logo()
     else:
-        print(f"unknown mode: {mode} (use: preview | build)")
+        print(f"unknown mode: {mode} (use: preview | build | backup)")
         sys.exit(2)
 
 

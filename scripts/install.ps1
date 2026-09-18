@@ -62,4 +62,9 @@ if ($Autostart) {
     Write-Output "autostart     : OFF"
 }
 
+# Windows caches shell icons by path and ignores the file's timestamp, so a
+# freshly rebuilt exe keeps showing the OLD icon until the cache is nudged.
+Start-Process 'ie4uinit.exe' -ArgumentList '-show' -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
+Write-Output "icon cache    : refreshed"
+
 Write-Output "done."
