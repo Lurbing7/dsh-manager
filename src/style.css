@@ -717,13 +717,12 @@ select.input {
 
 .toast {
   position: fixed;
-  left: 50%;
-  /* top, not bottom: the bottom strip belongs to the floating buttons and the
-     chart's axis labels */
+  /* top-right: the header's status pill lives top-centre and the axis labels
+     need the bottom strip */
   top: 14px;
-  transform: translateX(-50%);
+  right: 22px;
   margin: 0;
-  max-width: 620px;
+  max-width: 460px;
   padding: 9px 16px;
   border-radius: var(--r-pill);
   font-size: 12.5px;
@@ -733,6 +732,14 @@ select.input {
   color: var(--fg);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
   z-index: 60;
+  animation: toast-in 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
 }
 
 .toast.ok {

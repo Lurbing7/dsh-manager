@@ -1903,7 +1903,7 @@ fn usage_series(app: AppHandle, bucket: Option<String>, count: Option<u32>) -> U
     let default_count = match bucket.as_str() {
         "week" => 8,
         "month" => 12,
-        _ => 7,
+        _ => 14,
     };
     let count = count.unwrap_or(default_count).clamp(1, 60);
 
@@ -2060,6 +2060,113 @@ fn usage_series(app: AppHandle, bucket: Option<String>, count: Option<u32>) -> U
     }
 }
 
+/// Read one secret out of the harness credential store (`~/.dsh/.credentials.yaml`).
+///
+/// Only `refs.<NAME>` is needed, so this scans lines instead of pulling in a YAML
+/// parser: it keeps unrelated secrets off the heap entirely, and the file is a
+/// flat `refs:` block in every version we have seen.
+fn read_dsh_credential(name: &str) -> Option<String> {
+    let home = std::env::var("USERPROFILE").ok()?;
+    let path = PathBuf::from(home).join(".dsh").join(".credentials.yaml");
+    let text = std::fs::read_to_string(path).ok()?;
+
+    let mut in_refs = false;
+    let prefix = format!("{name}:");
+    for line in text.lines() {
+        if !in_refs {
+            if line.trim_start().starts_with("refs:") && !line.starts_with(' ') {
+                in_refs = true;
+            }
+            continue;
+        }
+        // A non-indented, non-empty line ends the refs block.
+        if !line.trim().is_empty() && !line.starts_with(' ') && !line.starts_with('\t') {
+            break;
+        }
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            let value = rest.trim().trim_matches(|c| c == '"' || c == '\'');
+            if !value.is_empty() && !value.starts_with('<') {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Query the provider balance ourselves.
+///
+/// The plugin used to do this, but the whole point of the panel owning its own
+/// data is that uninstalling plugins must not remove working features.
+#[tauri::command]
+async fn get_balance_native(provider: Option<String>) -> BalanceInfo {
+    let provider = provider.unwrap_or_else(|| "deepseek".into());
+    let fail = |err: String| BalanceInfo {
+        ok: false,
+        provider: provider.clone(),
+        currency: String::new(),
+        total: String::new(),
+        topped_up: String::new(),
+        granted: String::new(),
+        queried_at: 0,
+        error: Some(err),
+    };
+
+    let Some(key) = read_dsh_credential("DEEPSEEK_API_KEY") else {
+        return fail("在 ~/.dsh/.credentials.yaml 的 refs 里找不到 DEEPSEEK_API_KEY".into());
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return fail(format!("创建 HTTP 客户端失败: {e}")),
+    };
+
+    let resp = match client
+        .get("https://api.deepseek.com/user/balance")
+        .bearer_auth(&key)
+        .header("Accept", "application/json")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return fail(format!("请求 DeepSeek 余额接口失败: {e}")),
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        return fail(match status.as_u16() {
+            401 => "DeepSeek 返回 401：API Key 无效或已撤销".to_string(),
+            402 => "DeepSeek 返回 402：账户余额不足".to_string(),
+            _ => format!("DeepSeek 返回 HTTP {status}"),
+        });
+    }
+
+    let value: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => return fail(format!("解析余额响应失败: {e}")),
+    };
+
+    let info = &value["balance_infos"][0];
+    let total = info["total_balance"].as_str().unwrap_or("").to_string();
+    if total.is_empty() {
+        return fail("余额响应里没有 total_balance".into());
+    }
+
+    BalanceInfo {
+        ok: true,
+        provider,
+        currency: info["currency"].as_str().unwrap_or("CNY").to_string(),
+        total,
+        topped_up: info["topped_up_balance"].as_str().unwrap_or("").to_string(),
+        granted: info["granted_balance"].as_str().unwrap_or("").to_string(),
+        queried_at: now_secs(),
+        error: None,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     detach_from_job_if_needed();
@@ -2159,6 +2266,7 @@ pub fn run() {
             stop_desktop_app,
             desktop_running,
             get_balance,
+            get_balance_native,
             get_usage_summary,
             import_plugin_usage,
             usage_series,

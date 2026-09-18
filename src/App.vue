@@ -124,8 +124,18 @@ let unlisten: UnlistenFn | null = null;
 let unlistenHarness: UnlistenFn | null = null;
 let unlistenTerm: UnlistenFn | null = null;
 
+/** Transient notice. Success/info vanish after ~3s, errors linger a bit longer. */
+let toastTimer: number | null = null;
 function say(kind: "info" | "ok" | "err", text: string) {
   toast.value = { kind, text };
+  if (toastTimer !== null) window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(
+    () => {
+      toast.value = null;
+      toastTimer = null;
+    },
+    kind === "err" ? 6000 : 3000,
+  );
 }
 
 async function appendTerm(line: string) {
@@ -170,7 +180,9 @@ async function saveSourceDir() {
 
 async function refreshBalance() {
   try {
-    balance.value = await invoke<BalanceInfo>("get_balance", { provider: "deepseek" });
+    // Native query: reads the API key from the harness credential store, so it
+    // keeps working after the usage plugin is uninstalled.
+    balance.value = await invoke<BalanceInfo>("get_balance_native", { provider: "deepseek" });
   } catch {
     balance.value = null;
   }
@@ -180,7 +192,7 @@ async function refreshSeries() {
   try {
     series.value = await invoke<UsageSeries>("usage_series", {
       bucket: bucket.value,
-      count: bucket.value === "day" ? 7 : bucket.value === "week" ? 8 : 12,
+      count: bucket.value === "day" ? 14 : bucket.value === "week" ? 8 : 12,
     });
   } catch (e) {
     series.value = null;
@@ -237,7 +249,7 @@ const balanceText = computed(() => {
 /** Curve summary line under the chart. */
 const rangeText = computed(() => {
   if (!series.value?.ok) return "";
-  const label = bucket.value === "day" ? "近 7 天" : bucket.value === "week" ? "近 8 周" : "近 12 个月";
+  const label = bucket.value === "day" ? "近 14 天" : bucket.value === "week" ? "近 8 周" : "近 12 个月";
   return `${label}合计 ¥${series.value.total_cost.toFixed(2)} · ${series.value.total_calls.toLocaleString()} 次调用`;
 });
 
@@ -595,7 +607,7 @@ onUnmounted(() => {
             <p class="panel-sub">{{ rangeText }}</p>
           </div>
           <div class="segmented">
-            <button :class="{ active: bucket === 'day' }" @click="setBucket('day')">近 7 天</button>
+            <button :class="{ active: bucket === 'day' }" @click="setBucket('day')">近 14 天</button>
             <button :class="{ active: bucket === 'week' }" @click="setBucket('week')">近 8 周</button>
             <button :class="{ active: bucket === 'month' }" @click="setBucket('month')">近 12 月</button>
           </div>
@@ -607,7 +619,7 @@ onUnmounted(() => {
         </p>
 
         <p v-if="series?.ok && series.filled < series.points.length" class="gap-note">
-          这 {{ series.points.length }} 个区间里有 {{ series.filled }} 个有用量记录，其余为**空档**（不是零消耗）——空心圆点表示该区间没有数据。
+          这 {{ series.points.length }} 个区间里有 {{ series.filled }} 个有用量记录，其余为<strong>空档</strong>（不是零消耗）——空心圆点表示该区间没有数据。
         </p>
       </section>
     </main>
