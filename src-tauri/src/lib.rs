@@ -747,13 +747,19 @@ fn process_name(pid: u32) -> Option<String> {
 fn stop_harness(port: Option<u16>) -> ActionResult {
     let port = port.unwrap_or(DEFAULT_HARNESS_PORT);
 
+    // 1) A harness the panel launched: kill our own subtree (panel -> cmd -> node).
+    //    /T is safe here because those processes sit below us.
     if let Some(mut child) = HARNESS_CHILD
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap()
         .take()
     {
-        let _ = child.kill();
+        let pid = child.id();
+        let _ = Command::new("cmd")
+            .args(["/c", "taskkill", "/PID", &pid.to_string(), "/F", "/T"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
         let _ = child.wait();
         return ActionResult {
             ok: true,
@@ -763,6 +769,11 @@ fn stop_harness(port: Option<u16>) -> ActionResult {
         };
     }
 
+    // 2) A harness started elsewhere.
+    //
+    //    NEVER pass /T here. When the harness is what launched this panel (the
+    //    panel then sits below it in the process tree) /T would kill the panel
+    //    along with the target - the stop button would take the panel down too.
     let pids = pids_on_port(port);
     if pids.is_empty() {
         return ActionResult {
@@ -773,9 +784,14 @@ fn stop_harness(port: Option<u16>) -> ActionResult {
         };
     }
 
+    let me = std::process::id();
     let mut killed: Vec<u32> = Vec::new();
     let mut refused: Vec<u32> = Vec::new();
     for pid in pids {
+        if pid == me {
+            refused.push(pid);
+            continue;
+        }
         let is_node = process_name(pid)
             .map(|n| n.eq_ignore_ascii_case("node.exe"))
             .unwrap_or(false);
@@ -784,7 +800,7 @@ fn stop_harness(port: Option<u16>) -> ActionResult {
             continue;
         }
         let ok = Command::new("cmd")
-            .args(["/c", "taskkill", "/PID", &pid.to_string(), "/F", "/T"])
+            .args(["/c", "taskkill", "/PID", &pid.to_string(), "/F"])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map(|o| o.status.success())
