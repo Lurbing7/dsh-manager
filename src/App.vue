@@ -123,6 +123,24 @@ const bridgeRunning = ref(false);
 const bridgeUsers = ref("");
 const hermes = ref<HermesStatus | null>(null);
 let usageTimer: number | null = null;
+/** Counts poll ticks so the heavier session scan runs every 5 minutes. */
+let tick = 0;
+
+/**
+ * Rebuild today's numbers from the harness session logs. Works with no plugin
+ * installed; the scan keeps any cost already imported from the plugin.
+ */
+async function scanSessions() {
+  try {
+    const r = await invoke<ActionResult>("scan_sessions", { days: 30 });
+    if (r.ok) {
+      await refreshSeries();
+      await analysisRef.value?.load();
+    }
+  } catch {
+    // no sessions yet, or the harness home is elsewhere
+  }
+}
 
 let unlisten: UnlistenFn | null = null;
 let unlistenHarness: UnlistenFn | null = null;
@@ -553,10 +571,16 @@ onMounted(async () => {
   await refreshBridge();
   await refreshHermes();
 
+  // Refresh from the harness session logs. This is the source that keeps
+  // working after the usage plugin is uninstalled.
+  void scanSessions();
+
   // Balance costs a real provider call; the chart only needs local files.
   usageTimer = window.setInterval(() => {
     void refreshSeries();
     if (harnessUp.value) void refreshBalance();
+    // Session logs only grow; a periodic re-scan keeps today's numbers fresh.
+    if (tick++ % 5 === 0) void scanSessions();
   }, 60000);
 });
 
