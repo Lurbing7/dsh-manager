@@ -16,6 +16,13 @@ npm run tauri build            # 打包
 **顺序要求**：`cargo build` 之前 `dist/` 必须存在，否则 `tauri::generate_context!()` 编译失败。
 改了前端先 `npm run build`。
 
+**`cargo build`（debug）产出的 exe 不能独立运行**（已实测）：debug 构建**不内嵌前端**，
+启动后 WebView 去连 `http://localhost:1420`，没跑 `tauri dev` 时就显示
+「嗯…无法访问此页面 / localhost 拒绝连接」——看起来像应用坏了，其实是启动方式错了。
+要独立运行/长期使用必须 `npm run tauri build`（release 内嵌 dist），再跑 `scripts/install.ps1`。
+
+**`scripts/*.ps1` 一律纯 ASCII**（同 workspace 约定）。
+
 ## 关键约束（改代码前必读）
 
 1. **Rust 里调用命令行程序必须走 `cmd /c`**。`Command::new("dsh")` 或 `Command::new("npm")` 在 Windows 上找不到 `.cmd`（`CreateProcess` 不查 PATHEXT）。正确写法是 `Command::new("cmd").arg("/c")...`。

@@ -38,6 +38,28 @@ DeepSeek Harness 的 Windows 桌面小面板：常驻托盘，只做两件事—
 
 选 Tauri 而不是 Electron 的原因：本机已有 Tauri 项目跑通（`D:\projects\desktop-toolbox`），Rust 工具链就绪，产物是单 exe、体积小；而这个应用要做的事（起进程、查 HTTP、读文件）正好都在 Rust 侧。
 
+## 安装（日常使用）
+
+已经装好了，日常直接用快捷方式：
+
+- **桌面 / 开始菜单**：`DSH Panel`
+- **实际位置**：`%LOCALAPPDATA%\Programs\dsh-panel\dsh-panel.exe`
+- **开机自启**：启动文件夹里有快捷方式，登录后自动进托盘（「每天检查 1 次」靠它才生效）
+
+重新编译后重装（会替换 exe，保留快捷方式与自启设置）：
+
+```powershell
+npm run tauri build
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Autostart
+```
+
+不要自启就把 `-Autostart` 换成 `-Autostart:$false`。
+
+> ⚠️ **别直接跑 `src-tauri\target\debug\dsh-panel.exe`**：debug 构建**不内嵌前端**，启动后
+> WebView 会去连 `http://localhost:1420`（`tauri dev` 起的 Vite 服务），没跑 dev server 时
+> 就显示「嗯…无法访问此页面 / localhost 拒绝连接」。要独立运行必须用 **release** 构建，
+> 即 `npm run tauri build`。
+
 ## 运行
 
 ```bash
@@ -45,10 +67,10 @@ npm install
 npm run tauri dev          # 开发（热重载）
 npm run build              # 只做前端类型检查 + 构建
 cd src-tauri && cargo check  # 只检查 Rust
-npm run tauri build        # 打包 exe / 安装包
+npm run tauri build        # 打包 release exe / 安装包
 ```
 
-打包产物在 `src-tauri/target/release/bundle/`。
+打包产物在 `src-tauri/target/release/`（exe）与 `.../bundle/`（msi / nsis 安装包）。
 
 ## 目录结构
 
