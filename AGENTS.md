@@ -60,14 +60,22 @@ npm run tauri build            # 打包
    - `start_harness_inline(port?) -> ActionResult`（界面用这个）
    - `stop_harness(port?) -> ActionResult`（先杀面板启动的子进程；否则按端口找 node 进程）
    - `harness_running() -> bool`、`quit_app()`
-   - `get_settings() / set_desktop_source_dir(dir) -> ActionResult`（存 `settings.json`）
+   - `get_settings() -> SettingsView`（含 api_key_set/hint/source、feishu_paired/app_id/allowed_users；**不含任何密钥**）
+   - `set_api_key(key?) -> ActionResult`（面板内保存的 key 优先于 DSH 凭据文件）
+   - `set_feishu_allowed_users(users) -> ActionResult`
+   - `set_desktop_source_dir(dir) -> ActionResult`（存 `settings.json`）
    - `start_desktop_app() / stop_desktop_app() / desktop_running() -> bool`
-   - `get_balance(provider?) -> BalanceInfo`
-   - `get_usage_summary(days?) -> UsageSummary`
+   - `get_balance_native(app, provider?) -> BalanceInfo`
+   - `usage_series(bucket?, count?) -> UsageSeries`（day / week / month 聚合）
+   - `usage_analysis(days?) -> UsageAnalysis`（指标卡 + 模型明细 + 会话排行）
+   - `scan_sessions(days?) / scan_sessions_diag(limit?) -> ActionResult`（解析会话日志）
    - `list_plugins() -> Vec<ProfilePlugins>`
    - `install_plugin(profile, package) / remove_plugin(profile, package) / upgrade_plugins(profile) -> ActionResult`
    - `plugin_op_running() -> bool`
    - `feishu_bridge_status() -> BridgeStatus` / `feishu_bridge_start(allowed_users, profile?) -> ActionResult` / `feishu_bridge_stop() -> ActionResult`
+   - `feishu_qr_begin() -> FeishuQrSession` / `feishu_qr_poll(device_code) -> FeishuQrPoll` / `feishu_qr_apply(app_id, app_secret, open_id) -> ActionResult`
+   - `hermes_status() -> HermesStatus` / `open_hermes_page() -> ActionResult`
+   - `open_harness_page(port?) -> ActionResult`（纯导航，绝不启动）
    事件：`update-checked`(UpdateInfo) · `harness-state`(bool) · `harness-output`(每行字符串)。
    改返回结构要**两边一起改**（`lib.rs` 的 struct + `App.vue` 的 interface）。
 9. **后端一律不返回 `Err`**，用带 `ok` / `error` 字段的结构体。前端展示更简单，不会出现"命令静默失败"。
