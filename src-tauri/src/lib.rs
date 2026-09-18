@@ -329,6 +329,18 @@ struct Settings {
     /// that file moves or changes format.
     #[serde(default)]
     deepseek_api_key: Option<String>,
+    /// Feishu app credentials, filled by the QR onboarding flow.
+    ///
+    /// Same storage and trust level as the API key above. Written only by
+    /// `feishu_qr_apply`, never echoed back to the UI.
+    #[serde(default)]
+    feishu_app_id: Option<String>,
+    #[serde(default)]
+    feishu_app_secret: Option<String>,
+    /// open_ids allowed to drive the bridge. Seeded with the pairing user, so
+    /// the bridge is never started with an empty allow-list by accident.
+    #[serde(default)]
+    feishu_allowed_users: Option<Vec<String>>,
 }
 
 /// The settings as the UI sees them: never the raw key, only whether one exists
@@ -2624,6 +2636,250 @@ fn scan_sessions(app: AppHandle, days: Option<u32>) -> ActionResult {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Feishu QR onboarding
+//
+// Feishu's own device-code registration flow: the panel shows a QR code, the
+// user scans it in the Feishu app, and the endpoint hands back a freshly created
+// app's credentials plus the scanning user's open_id. That removes the whole
+// manual "create an app in the developer console and copy two secrets" step.
+//
+// A 400 is a normal in-progress answer here, so the body is parsed on non-2xx.
+// ---------------------------------------------------------------------------
+
+const FEISHU_REGISTRATION_URL: &str = "https://accounts.feishu.cn/oauth/v1/app/registration";
+
+#[derive(Serialize, Clone)]
+struct FeishuQrSession {
+    ok: bool,
+    device_code: String,
+    /// The string to encode as a QR code.
+    qr_url: String,
+    /// Short code the user can type instead of scanning.
+    user_code: String,
+    /// Seconds between polls, as instructed by the endpoint.
+    interval: u64,
+    /// Seconds until the code expires.
+    expire_in: u64,
+    error: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct FeishuQrPoll {
+    /// "pending" | "done" | "denied" | "expired" | "error"
+    state: String,
+    app_id: String,
+    open_id: String,
+    /// On success this carries the app secret; otherwise a human message.
+    message: String,
+}
+
+/// POST form data to the registration endpoint, parsing JSON even on 4xx.
+async fn feishu_registration_post(body: Vec<(&str, String)>) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(FEISHU_REGISTRATION_URL)
+        .form(&body)
+        .send()
+        .await
+        .map_err(|e| format!("请求飞书注册接口失败: {e}"))?;
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "解析响应失败: {e}（原文前 200 字: {}）",
+            text.chars().take(200).collect::<String>()
+        )
+    })
+}
+
+/// Start the device-code flow and return the URL to render as a QR code.
+#[tauri::command]
+async fn feishu_qr_begin() -> FeishuQrSession {
+    let fail = |err: String| FeishuQrSession {
+        ok: false,
+        device_code: String::new(),
+        qr_url: String::new(),
+        user_code: String::new(),
+        interval: 5,
+        expire_in: 0,
+        error: Some(err),
+    };
+
+    let body = vec![
+        ("action", "begin".to_string()),
+        // PersonalAgent provisions a bot the user owns, which is what the
+        // bridge needs (it both receives and answers messages).
+        ("archetype", "PersonalAgent".to_string()),
+        ("auth_method", "client_secret".to_string()),
+        ("request_user_info", "open_id".to_string()),
+    ];
+
+    let value = match feishu_registration_post(body).await {
+        Ok(v) => v,
+        Err(e) => return fail(e),
+    };
+
+    let Some(device_code) = value["device_code"].as_str() else {
+        return fail(format!(
+            "飞书没有返回 device_code：{}",
+            serde_json::to_string(&value)
+                .unwrap_or_default()
+                .chars()
+                .take(300)
+                .collect::<String>()
+        ));
+    };
+
+    let qr_url = value["verification_uri_complete"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    if qr_url.is_empty() {
+        return fail("飞书没有返回 verification_uri_complete（二维码地址）".into());
+    }
+
+    FeishuQrSession {
+        ok: true,
+        device_code: device_code.to_string(),
+        qr_url,
+        user_code: value["user_code"].as_str().unwrap_or("").to_string(),
+        interval: value["interval"].as_u64().unwrap_or(5).max(2),
+        expire_in: value["expire_in"].as_u64().unwrap_or(600),
+        error: None,
+    }
+}
+
+/// Poll once. The frontend repeats this on `interval` until the state is final.
+#[tauri::command]
+async fn feishu_qr_poll(device_code: String) -> FeishuQrPoll {
+    let body = vec![
+        ("action", "poll".to_string()),
+        ("device_code", device_code),
+        ("tp", "ob_app".to_string()),
+    ];
+
+    let value = match feishu_registration_post(body).await {
+        Ok(v) => v,
+        Err(e) => {
+            return FeishuQrPoll {
+                state: "error".into(),
+                app_id: String::new(),
+                open_id: String::new(),
+                message: e,
+            }
+        }
+    };
+
+    if let (Some(app_id), Some(secret)) =
+        (value["client_id"].as_str(), value["client_secret"].as_str())
+    {
+        return FeishuQrPoll {
+            state: "done".into(),
+            app_id: app_id.to_string(),
+            open_id: value["user_info"]["open_id"].as_str().unwrap_or("").to_string(),
+            message: secret.to_string(),
+        };
+    }
+
+    match value["error"].as_str().unwrap_or("") {
+        "access_denied" => FeishuQrPoll {
+            state: "denied".into(),
+            app_id: String::new(),
+            open_id: String::new(),
+            message: "你在飞书里拒绝了这次授权".into(),
+        },
+        "expired_token" => FeishuQrPoll {
+            state: "expired".into(),
+            app_id: String::new(),
+            open_id: String::new(),
+            message: "二维码已过期，请重新获取".into(),
+        },
+        _ => FeishuQrPoll {
+            state: "pending".into(),
+            app_id: String::new(),
+            open_id: String::new(),
+            message: "等待扫码…".into(),
+        },
+    }
+}
+
+/// Persist the credentials Feishu just issued, bind lark-cli to them, and seed
+/// the bridge allow-list with the scanning user's open_id.
+#[tauri::command]
+fn feishu_qr_apply(
+    app: AppHandle,
+    app_id: String,
+    app_secret: String,
+    open_id: String,
+) -> ActionResult {
+    let mut settings = load_settings(&app);
+    settings.feishu_app_id = Some(app_id.trim().to_string());
+    settings.feishu_app_secret = Some(app_secret.trim().to_string());
+    if !open_id.trim().is_empty() {
+        settings.feishu_allowed_users = Some(vec![open_id.trim().to_string()]);
+    }
+    save_settings(&app, &settings);
+
+    // Bind lark-cli so its IM commands use this app. `--app-secret-stdin` keeps
+    // the secret off the process command line.
+    let mut child = match Command::new("cmd")
+        .arg("/c")
+        .arg("lark-cli")
+        .arg("config")
+        .arg("init")
+        .arg("--app-id")
+        .arg(app_id.trim())
+        .arg("--app-secret-stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ActionResult {
+                ok: false,
+                action: "feishu-qr".into(),
+                message: format!("凭据已保存，但启动 lark-cli 失败: {e}"),
+                output: String::new(),
+            }
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(app_secret.trim().as_bytes());
+        let _ = stdin.write_all(b"\n");
+    }
+    let bind_ok = child
+        .wait_with_output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let allowed = settings
+        .feishu_allowed_users
+        .as_ref()
+        .map(|v| v.join(", "))
+        .unwrap_or_default();
+
+    ActionResult {
+        ok: true,
+        action: "feishu-qr".into(),
+        message: if bind_ok {
+            format!("配对完成。已绑定 lark-cli，白名单已设为 {allowed}")
+        } else {
+            format!(
+                "配对完成、凭据已保存，但 lark-cli config init 没有成功（可能未安装）。白名单已设为 {allowed}"
+            )
+        },
+        output: String::new(),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Headless diagnostics: `dsh-panel.exe --scan-sessions [file-limit]`.
@@ -2791,6 +3047,9 @@ pub fn run() {
             feishu_bridge_status,
             feishu_bridge_start,
             feishu_bridge_stop,
+            feishu_qr_begin,
+            feishu_qr_poll,
+            feishu_qr_apply,
             open_harness_page,
             hermes_status,
             open_hermes_page,

@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import QRCode from "qrcode";
 import UsageChart from "./components/UsageChart.vue";
 import UsageAnalysis from "./components/UsageAnalysis.vue";
 import type { UsagePoint } from "./types";
@@ -85,6 +86,25 @@ interface BridgeStatus {
   script: string;
 }
 
+interface FeishuQrSession {
+  ok: boolean;
+  device_code: string;
+  qr_url: string;
+  user_code: string;
+  interval: number;
+  expire_in: number;
+  error: string | null;
+}
+
+interface FeishuQrPoll {
+  /** pending | done | denied | expired | error */
+  state: string;
+  app_id: string;
+  open_id: string;
+  /** On success this is the app secret. */
+  message: string;
+}
+
 interface HermesPlatform {
   name: string;
   state: string;
@@ -131,6 +151,12 @@ const activeProfile = ref("web");
 const newPlugin = ref("");
 const bridgeRunning = ref(false);
 const bridgeUsers = ref("");
+/** Feishu QR pairing. */
+const feishuQrOpen = ref(false);
+const feishuQr = ref<FeishuQrSession | null>(null);
+const feishuQrImage = ref("");
+const feishuQrStatus = ref("");
+let qrPollTimer: number | null = null;
 const hermes = ref<HermesStatus | null>(null);
 let usageTimer: number | null = null;
 /** Counts poll ticks so the heavier session scan runs every 5 minutes. */
@@ -493,6 +519,75 @@ async function refreshBridge() {
   }
 }
 
+function stopQrPolling() {
+  if (qrPollTimer !== null) {
+    window.clearInterval(qrPollTimer);
+    qrPollTimer = null;
+  }
+}
+
+/**
+ * Start Feishu's device-code flow and render its QR code.
+ *
+ * The endpoint creates a fresh app on scan and returns its credentials plus the
+ * scanning user's open_id, so this replaces the manual developer-console steps.
+ */
+async function beginFeishuQr() {
+  stopQrPolling();
+  feishuQrOpen.value = true;
+  feishuQr.value = null;
+  feishuQrImage.value = "";
+  feishuQrStatus.value = "正在向飞书申请二维码…";
+  try {
+    const session = await invoke<FeishuQrSession>("feishu_qr_begin");
+    if (!session.ok || !session.qr_url) {
+      feishuQrStatus.value = session.error ?? "申请二维码失败";
+      return;
+    }
+    feishuQr.value = session;
+    feishuQrImage.value = await QRCode.toDataURL(session.qr_url, { width: 280, margin: 1 });
+    feishuQrStatus.value = `请用飞书扫码${
+      session.user_code ? `（或输入 ${session.user_code}）` : ""
+    }，${session.expire_in} 秒内有效`;
+
+    const deadline = Date.now() + session.expire_in * 1000;
+    qrPollTimer = window.setInterval(async () => {
+      if (Date.now() > deadline) {
+        stopQrPolling();
+        feishuQrStatus.value = "二维码已过期，请重新获取";
+        return;
+      }
+      try {
+        const r = await invoke<FeishuQrPoll>("feishu_qr_poll", {
+          deviceCode: session.device_code,
+        });
+        if (r.state === "pending") return;
+        stopQrPolling();
+        if (r.state !== "done") {
+          feishuQrStatus.value = r.message;
+          return;
+        }
+        feishuQrStatus.value = "扫码成功，正在保存配置…";
+        const applied = await invoke<ActionResult>("feishu_qr_apply", {
+          appId: r.app_id,
+          appSecret: r.message,
+          openId: r.open_id,
+        });
+        feishuQrStatus.value = applied.message;
+        feishuQrImage.value = "";
+        say(applied.ok ? "ok" : "err", applied.message);
+        await loadSettings();
+        await refreshBridge();
+      } catch (e) {
+        stopQrPolling();
+        feishuQrStatus.value = String(e);
+      }
+    }, Math.max(2, session.interval) * 1000);
+  } catch (e) {
+    feishuQrStatus.value = String(e);
+  }
+}
+
 async function startBridge() {
   busy.value = "feishu";
   try {
@@ -588,6 +683,7 @@ onUnmounted(() => {
   unlisten?.();
   unlistenHarness?.();
   unlistenTerm?.();
+  stopQrPolling();
   if (usageTimer !== null) window.clearInterval(usageTimer);
 });
 </script>
@@ -817,6 +913,7 @@ onUnmounted(() => {
             <input v-model="bridgeUsers" class="input mono" type="text" spellcheck="false" placeholder="白名单 open_id（ou_ 开头，逗号分隔）" />
           </div>
           <div class="btn-row">
+            <button class="accent" :disabled="!!busy" @click="beginFeishuQr">扫码配对飞书</button>
             <button :class="{ 'danger-outline': bridgeRunning }" :disabled="!!busy" @click="bridgeRunning ? stopBridge() : startBridge()">
               {{ bridgeRunning ? "停止桥" : "启动桥" }}
             </button>
@@ -859,6 +956,22 @@ onUnmounted(() => {
         </section>
       </div>
     </aside>
+
+    <div v-if="feishuQrOpen" class="scrim" @click="feishuQrOpen = false; stopQrPolling()"></div>
+    <div v-if="feishuQrOpen" class="qr-modal">
+      <h3>扫码配对飞书</h3>
+      <img v-if="feishuQrImage" :src="feishuQrImage" class="qr-img" alt="飞书配对二维码" />
+      <div v-else class="qr-placeholder">…</div>
+      <p class="qr-status">{{ feishuQrStatus }}</p>
+      <div class="btn-row">
+        <button v-if="!feishuQrImage" class="accent" @click="beginFeishuQr">重新获取二维码</button>
+        <button @click="feishuQrOpen = false; stopQrPolling()">关闭</button>
+      </div>
+      <p class="hint qr-hint">
+        扫码后飞书会<strong>自动创建一个属于你的应用</strong>并把凭据交回面板，同时把扫码人的 open_id
+        填进白名单 —— 不需要去开放平台手动建应用。
+      </p>
+    </div>
 
     <p v-if="toast" class="toast" :class="toast.kind">{{ toast.text }}</p>
   </div>
